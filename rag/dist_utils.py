@@ -113,7 +113,7 @@ def avg_dist_dict(keys, dictionary):
 def save_distributed_dataset(data, dataset_name, global_rank, dir_path):
     dir_path = Path(dir_path)
     write_path = dir_path / "tmp_dir"
-    write_path.mkdir(exist_ok=True)
+    write_path.mkdir(parents=True, exist_ok=True)
     tmp_path = write_path / f"{global_rank}.json"
     with open(tmp_path, "w") as fw:
         json.dump(data, fw)
