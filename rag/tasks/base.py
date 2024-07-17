@@ -2,6 +2,7 @@ import json
 import logging
 import random
 from collections import defaultdict
+from typing import Any, Generator
 
 from rag.tasks.evaluation import exact_match_score
 
@@ -22,7 +23,7 @@ class BaseTask(object):
         repeat_if_less_than_world_size=False,
         *args,
         **kwargs,
-    ):
+    ) -> Generator[dict[str, Any], None, None]:
         if isinstance(filenames, str):
             filenames = [filenames]
 

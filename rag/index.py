@@ -272,7 +272,9 @@ def load_passages(filenames, maxload=-1):
 def load_or_initialize_index(
     args, logger, dim
 ) -> tuple[DistributedIndex, list[dict[str, str]]]:
-    index = DistributedIndex(dtype=DTYPE_TO_TORCH_DTYPE[args.idxdtype], **args)
+    index = DistributedIndex(
+        dtype=DTYPE_TO_TORCH_DTYPE[args.idxdtype], **vars(args)
+    )
 
     if args.load_index_path is not None:
         logger.info(f"Loading index from: {args.load_index_path}")

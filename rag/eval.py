@@ -5,13 +5,14 @@ import logging
 import math
 import os
 import time
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
 from rag import dist_utils
-from rag.index import load_or_initialize_index
+from rag.index import DistributedIndex, load_or_initialize_index
 from rag.tasks import get_task
 from gritlm import GritLM
 
@@ -216,7 +217,7 @@ def build_index(
     logger.info(f"{total} passages encoded on process: {dist_utils.get_rank()}")
 
 
-def _get_eval_data_iterator(args, data_path, task):
+def _get_eval_data_iterator(args, data_path, task) -> list[dict[str, Any]]:
     data_iterator = task.data_iterator(data_path)
     data_iterator = filter(None, map(task.process, data_iterator))
     data_iterator = list(
@@ -236,7 +237,12 @@ def _get_eval_data_iterator(args, data_path, task):
 
 
 @torch.no_grad()
-def evaluate(model, index, opt, data_path):
+def evaluate(
+    model: GritLM,
+    index: DistributedIndex,
+    opt: argparse.Namespace,
+    data_path: str,
+):
     model.eval()
     metrics = defaultdict(lambda: [])
     dataset_wpred = []
@@ -261,9 +267,7 @@ def evaluate(model, index, opt, data_path):
     time_to_remove = 0
     for i, batch in enumerate(tqdm(data_iterator)):
         query: list[str] = batch.get("query", [""])
-        answers: list[str] = batch.get("answers", [""])
-        logger.info(f"Query: {query}")
-        logger.info(f"Answers: {answers}")
+        answers: list[list[str]] = batch.get("answers", [[""]])
 
         batch_metadata = batch.get("metadata")
         target_tokens = batch.get("target_tokens")
@@ -274,6 +278,9 @@ def evaluate(model, index, opt, data_path):
 
         start_time = time.time()
         if opt.no_retrieval is False:
+            query_emb: torch.Tensor
+            kv_cache: Optional[list[tuple[torch.Tensor, torch.Tensor]]]
+
             if (args.cache is not None) and ("query" in args.cache):
                 query_emb, kv_cache = model.encode_queries(
                     query,
@@ -293,7 +300,7 @@ def evaluate(model, index, opt, data_path):
                     add_special_tokens=True,
                 )
                 kv_cache = None
-            passages, scores = index.search_knn(query_emb, args.n_context)
+            passages, _ = index.search_knn(query_emb, args.n_context)
             assert (len(passages) == 1) and (
                 len(passages[0]) == 1
             ), "Only 1 passage per query supported for now"
@@ -415,7 +422,7 @@ def evaluate(model, index, opt, data_path):
                 ),
                 dim=1,
             )
-        generation = model.generate(
+        generation: torch.LongTensor = model.generate(
             **inputs,
             min_new_tokens=opt.min_new_tokens,
             max_new_tokens=opt.max_new_tokens,
@@ -425,9 +432,13 @@ def evaluate(model, index, opt, data_path):
         times.append(time.time() - start_time - time_to_remove)
 
         generation = generation[0][len(inputs["input_ids"][0]) :]
-        pred = model.tokenizer.decode(generation, skip_special_tokens=True)
+        pred: str = model.tokenizer.decode(generation, skip_special_tokens=True)
+
         # Use em as main key since if em=1, then match & f1 are also 1
-        sample_metrics = task.evaluation(pred, answers)
+        sample_metrics = max(
+            [task.evaluation(pred, ans) for ans in answers],
+            key=lambda x: x["exact_match"],
+        )
 
         for key, value in sample_metrics.items():
             metrics[key].append(value)
@@ -561,7 +572,6 @@ if __name__ == "__main__":
 
     if args.max_length is not None:
         gritlm_kwargs["max_length"] = args.max_length
-
     model = GritLM(args.model_name_or_path, **gritlm_kwargs)
     model.eval()
 
