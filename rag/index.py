@@ -12,23 +12,28 @@ from rag import dist_utils
 logger = logging.getLogger(__name__)
 
 DTYPE_TO_TORCH_DTYPE = {
-    'bfloat16': torch.bfloat16,
-    'float32': torch.float32,
-    'float16': torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+    "float16": torch.float16,
 }
 
+
 class DistributedIndex(object):
-    def __init__(self, dtype=torch.float32):
+    def __init__(
+        self,
+        dtype=torch.float32,
+        embed_max_vectors_in_gpu: int = 1000000,
+        **kwargs,
+    ):
         self.embeddings = None
         self.doc_map = dict()
         self.is_in_gpu = True if torch.cuda.is_available() else False
+        self.embed_max_vectors_in_gpu = embed_max_vectors_in_gpu
         self.dtype = dtype
 
     def init_embeddings(self, passages, dim: Optional[int]):
         self.doc_map = {i: doc for i, doc in enumerate(passages)}
         self.embeddings = torch.zeros(dim, (len(passages)), dtype=self.dtype)
-        if self.is_in_gpu:
-            self.embeddings = self.embeddings.cuda()
 
     def _get_saved_embedding_path(self, save_dir: str, shard: int) -> str:
         return os.path.join(save_dir, f"embeddings.{shard}.pt")
@@ -36,7 +41,12 @@ class DistributedIndex(object):
     def _get_saved_passages_path(self, save_dir: str, shard: int) -> str:
         return os.path.join(save_dir, f"passages.{shard}.pt")
 
-    def save_index(self, path: str, total_saved_shards: int, overwrite_saved_passages: bool = False) -> None:
+    def save_index(
+        self,
+        path: str,
+        total_saved_shards: int,
+        overwrite_saved_passages: bool = False,
+    ) -> None:
         """
         Saves index state to disk, which can later be loaded by the load_index method.
         Specifically, it saves the embeddings and passages into total_saved_shards separate file shards.
@@ -47,21 +57,38 @@ class DistributedIndex(object):
         assert self.embeddings is not None
         rank = dist_utils.get_rank()
         ws = dist_utils.get_world_size()
-        assert total_saved_shards % ws == 0, f"N workers must be a multiple of shards to save"
+        assert (
+            total_saved_shards % ws == 0
+        ), f"N workers must be a multiple of shards to save"
         shards_per_worker = total_saved_shards // ws
         n_embeddings = self.embeddings.shape[1]
         embeddings_per_shard = math.ceil(n_embeddings / shards_per_worker)
         assert n_embeddings == len(self.doc_map), len(self.doc_map)
-        for shard_ind, (shard_start) in enumerate(range(0, n_embeddings, embeddings_per_shard)):
+        for shard_ind, (shard_start) in enumerate(
+            range(0, n_embeddings, embeddings_per_shard)
+        ):
             shard_end = min(shard_start + embeddings_per_shard, n_embeddings)
-            shard_id = shard_ind + rank * shards_per_worker  # get global shard number
+            shard_id = (
+                shard_ind + rank * shards_per_worker
+            )  # get global shard number
             passage_shard_path = self._get_saved_passages_path(path, shard_id)
-            if not os.path.exists(passage_shard_path) or overwrite_saved_passages:
-                passage_shard = [self.doc_map[i] for i in range(shard_start, shard_end)]
+            if (
+                not os.path.exists(passage_shard_path)
+                or overwrite_saved_passages
+            ):
+                passage_shard = [
+                    self.doc_map[i] for i in range(shard_start, shard_end)
+                ]
                 with open(passage_shard_path, "wb") as fobj:
-                    pickle.dump(passage_shard, fobj, protocol=pickle.HIGHEST_PROTOCOL)
-            embeddings_shard = self.embeddings[:, shard_start:shard_end]#.clone()
-            embedding_shard_path = self._get_saved_embedding_path(path, shard_id)
+                    pickle.dump(
+                        passage_shard, fobj, protocol=pickle.HIGHEST_PROTOCOL
+                    )
+            embeddings_shard = self.embeddings[
+                :, shard_start:shard_end
+            ]  # .clone()
+            embedding_shard_path = self._get_saved_embedding_path(
+                path, shard_id
+            )
             torch.save(embeddings_shard, embedding_shard_path)
 
     def load_index(self, path: str, total_saved_shards: int):
@@ -70,19 +97,25 @@ class DistributedIndex(object):
         """
         rank = dist_utils.get_rank()
         ws = dist_utils.get_world_size()
-        assert total_saved_shards % ws == 0, f"N workers must be a multiple of shards to save"
+        assert (
+            total_saved_shards % ws == 0
+        ), f"N workers must be a multiple of shards to save"
         shards_per_worker = total_saved_shards // ws
         passages = []
         embeddings = []
-        for shard_id in range(rank * shards_per_worker, (rank + 1) * shards_per_worker):
+        for shard_id in range(
+            rank * shards_per_worker, (rank + 1) * shards_per_worker
+        ):
             passage_shard_path = self._get_saved_passages_path(path, shard_id)
             with open(passage_shard_path, "rb") as fobj:
                 passages.append(pickle.load(fobj))
-            embeddings_shard_path = self._get_saved_embedding_path(path, shard_id)
-            if self.is_in_gpu:
-                embeddings.append(torch.load(embeddings_shard_path, map_location="cpu").cuda())
-            else:
-                embeddings.append(torch.load(embeddings_shard_path, map_location="cpu"))
+            embeddings_shard_path = self._get_saved_embedding_path(
+                path, shard_id
+            )
+            embeddings.append(
+                torch.load(embeddings_shard_path, map_location="cpu")
+            )
+
         self.doc_map = {}
         n_passages = 0
         for chunk in passages:
@@ -94,14 +127,40 @@ class DistributedIndex(object):
         else:
             self.embeddings = embeddings[0]
 
-    def _compute_scores_and_indices(self, allqueries: torch.tensor, topk: int) -> Tuple[torch.tensor, torch.tensor]:
+    def _compute_scores_and_indices(
+        self, allqueries: torch.tensor, topk: int
+    ) -> Tuple[torch.tensor, torch.tensor]:
         """
         Computes the distance matrix for the query embeddings and embeddings chunk and returns the k-nearest neighbours and corresponding scores.
+        This function processes the embeddings in batches to avoid memory errors.
         """
-        scores = torch.matmul(allqueries.to(self.embeddings.device), self.embeddings)
-        scores, indices = torch.topk(scores, topk, dim=1)
+        allqueries = allqueries.to(self.embeddings.device)
+        all_scores = []
+        all_indices = []
 
-        return scores, indices
+        for i in range(
+            0, self.embeddings.size(1), self.embed_max_vectors_in_gpu
+        ):
+            batch_embeddings = self.embeddings[
+                :, i : i + self.embed_max_vectors_in_gpu
+            ].to(self.embeddings.device)
+            scores = torch.matmul(allqueries, batch_embeddings)
+            scores, indices = torch.topk(
+                scores, topk, dim=1, largest=True, sorted=True
+            )
+            all_scores.append(scores)
+            all_indices.append(indices + i)  # add offset
+
+        all_scores = torch.cat(all_scores, dim=1)
+        all_indices = torch.cat(all_indices, dim=1)
+
+        # Get the topk scores and indices across all batches
+        final_scores, indices = torch.topk(
+            all_scores, topk, dim=1, largest=True, sorted=True
+        )
+        final_indices = torch.gather(all_indices, 1, indices)
+
+        return final_scores.cpu(), final_indices.cpu()
 
     @torch.no_grad()
     def search_knn(self, queries, topk):
@@ -114,14 +173,27 @@ class DistributedIndex(object):
         # compute scores for the part of the index located on each process
         scores, indices = self._compute_scores_and_indices(allqueries, topk)
         indices = indices.tolist()
-        docs = [[self.doc_map[x] for x in sample_indices] for sample_indices in indices]
+        docs = [
+            [self.doc_map[x] for x in sample_indices]
+            for sample_indices in indices
+        ]
         if torch.distributed.is_initialized():
-            docs = [docs[allsizes[k] : allsizes[k + 1]] for k in range(len(allsizes) - 1)]
+            docs = [
+                docs[allsizes[k] : allsizes[k + 1]]
+                for k in range(len(allsizes) - 1)
+            ]
             docs = [serialize_listdocs(x) for x in docs]
-            scores = [scores[allsizes[k] : allsizes[k + 1]] for k in range(len(allsizes) - 1)]
-            gather_docs = [dist_utils.varsize_gather(docs[k], dst=k, dim=0) for k in range(dist_utils.get_world_size())]
+            scores = [
+                scores[allsizes[k] : allsizes[k + 1]]
+                for k in range(len(allsizes) - 1)
+            ]
+            gather_docs = [
+                dist_utils.varsize_gather(docs[k], dst=k, dim=0)
+                for k in range(dist_utils.get_world_size())
+            ]
             gather_scores = [
-                dist_utils.varsize_gather(scores[k], dst=k, dim=1) for k in range(dist_utils.get_world_size())
+                dist_utils.varsize_gather(scores[k], dst=k, dim=1)
+                for k in range(dist_utils.get_world_size())
             ]
             rank_scores = gather_scores[dist_utils.get_rank()]
             rank_docs = gather_docs[dist_utils.get_rank()]
@@ -136,7 +208,9 @@ class DistributedIndex(object):
         scores = scores.tolist()
         subindices = subindices.tolist()
         # Extract topk scores and associated ids
-        scores = [[scores[k][j] for j in idx] for k, idx in enumerate(subindices)]
+        scores = [
+            [scores[k][j] for j in idx] for k, idx in enumerate(subindices)
+        ]
         docs = [[docs[k][j] for j in idx] for k, idx in enumerate(subindices)]
         return docs, scores
 
@@ -156,7 +230,11 @@ def load_passages(filenames, maxload=-1):
         def load_item(line):
             if line.strip() != "":
                 item = json.loads(line)
-                if "title" in item and "section" in item and len(item["section"]) > 0:
+                if (
+                    "title" in item
+                    and "section" in item
+                    and len(item["section"]) > 0
+                ):
                     item["title"] = f"{item['title']}: {item['section']}"
                 return item
             else:
@@ -190,21 +268,30 @@ def load_passages(filenames, maxload=-1):
 
     return passages
 
-def load_or_initialize_index(args, logger, dim) -> tuple[DistributedIndex, list[dict[str, str]]]:
-    index = DistributedIndex(dtype=DTYPE_TO_TORCH_DTYPE[args.idxdtype])
+
+def load_or_initialize_index(
+    args, logger, dim
+) -> tuple[DistributedIndex, list[dict[str, str]]]:
+    index = DistributedIndex(dtype=DTYPE_TO_TORCH_DTYPE[args.idxdtype], **args)
 
     if args.load_index_path is not None:
         logger.info(f"Loading index from: {args.load_index_path}")
         index.load_index(args.load_index_path, args.save_index_n_shards)
         passages = [index.doc_map[i] for i in range(len(index.doc_map))]
+        logger.info(f"Loaded {len(passages)} passages")
+        logger.info(f"Loaded {len(index.embeddings)} embeddings")
+        logger.info(f"Example passage: {passages[0]}")
+        logger.info(f"Example embedding: {index.embeddings[:, 0]}")
     else:
         logger.info(f"Loading passages from: {args.passages}")
         passages = load_passages(args.passages)
         logger.info(f"Loaded {len(passages)} passages")
-        if args.limit is not None:            
-            passages = passages[args.limit_start:args.limit]
-            #passages = [max(passages, key=lambda x: len(x["text"]))]
-            logger.info(f"Limiting to {len(passages)} passages ({args.limit_start}-{args.limit})")
+        if args.limit is not None:
+            passages = passages[args.limit_start : args.limit]
+            # passages = [max(passages, key=lambda x: len(x["text"]))]
+            logger.info(
+                f"Limiting to {len(passages)} passages ({args.limit_start}-{args.limit})"
+            )
         if args.customd:
             if os.path.exists(args.customd):
                 with open(args.customd, "r") as f:

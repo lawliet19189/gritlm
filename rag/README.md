@@ -15,11 +15,9 @@ We have uploaded the index of GritLM-7B here: https://huggingface.co/datasets/Gr
 You can also follow the below to recreate it:
 
 ```bash
-python gritlm/rag/prepare_qa.py --output_directory gritlm/rag
-wget https://huggingface.co/datasets/BeIR/nq/resolve/main/corpus.jsonl.gz
-gunzip corpus.jsonl.gz
-mv corpus.jsonl gritlm/
 cd gritlm
+python -m rag.prepare_qa --output_directory rag/
+wget -O - https://huggingface.co/datasets/BeIR/nq/resolve/main/corpus.jsonl.gz | gunzip > corpus.jsonl
 python -m rag.eval --model_name_or_path GritLM/gritlm-7b --eval_data rag/nq_data/test.jsonl --passages corpus.jsonl --save_index_path index_nq
 ```
 

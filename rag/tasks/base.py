@@ -15,17 +15,32 @@ class BaseTask(object):
         self.filter = None
 
     @staticmethod
-    def data_iterator(filenames, world_rank=-1, world_size=-1, repeat_if_less_than_world_size=False, *args, **kwargs):
+    def data_iterator(
+        filenames,
+        world_rank=-1,
+        world_size=-1,
+        repeat_if_less_than_world_size=False,
+        *args,
+        **kwargs,
+    ):
         if isinstance(filenames, str):
             filenames = [filenames]
 
         def _iter():
             # iterate over files
-            return (line for filename in filenames for line in open(filename, encoding="utf-8"))
+            return (
+                line
+                for filename in filenames
+                for line in open(filename, encoding="utf-8")
+            )
 
         def _stop():
             # stop iterating over data when at least one example has been fed to each worker
-            return (total_yielded >= world_size) if repeat_if_less_than_world_size else (total_yielded > 0)
+            return (
+                (total_yielded >= world_size)
+                if repeat_if_less_than_world_size
+                else (total_yielded > 0)
+            )
 
         total_yielded = 0
         while not _stop():
@@ -37,7 +52,9 @@ class BaseTask(object):
                 yield example
 
     @staticmethod
-    def batch_iterator(data_iterator, batch_size, drop_last=False, shuffle=False):
+    def batch_iterator(
+        data_iterator, batch_size, drop_last=False, shuffle=False
+    ):
         if shuffle:
             data_iterator = BaseTask.shuffle_iterator(data_iterator)
         batch = defaultdict(lambda: [])
@@ -55,9 +72,13 @@ class BaseTask(object):
         if batch["__size__"] > 0 and not drop_last:
             yield batch
 
-    def evaluation(self, prediction, ground_truths):
+    def evaluation(
+        self, prediction: str, ground_truths: list[str]
+    ) -> dict[str, float]:
         """most basic evaluation: checks if prediction matches ground truth"""
-        sample_metrics = {"accuracy": exact_match_score(prediction, ground_truths)}
+        sample_metrics = {
+            "accuracy": exact_match_score(prediction, ground_truths)
+        }
         return sample_metrics
 
     @staticmethod
@@ -69,10 +90,18 @@ class BaseTask(object):
 
     def process(self, example, *args, **kwargs):
         """most basic example processing, should be overwritten in subclasses"""
-        assert "target" in example, "base task requires a `target` field string to be defined"
-        assert "query" in example, "base task requires a `query` field string to be defined"
-        assert type(example["target"]) == str, "base task requires a `target` field string to be defined"
-        assert type(example["query"]) == str, "base task requires a `query` field string to be defined"
+        assert (
+            "target" in example
+        ), "base task requires a `target` field string to be defined"
+        assert (
+            "query" in example
+        ), "base task requires a `query` field string to be defined"
+        assert (
+            type(example["target"]) == str
+        ), "base task requires a `target` field string to be defined"
+        assert (
+            type(example["query"]) == str
+        ), "base task requires a `query` field string to be defined"
 
         if not "passages" in example:
             example["passages"] = [{"title": "", "text": ""}]
@@ -84,7 +113,9 @@ class BaseTask(object):
         return metrics, dataset_with_predictions
 
 
-def filter_results_by_id(batch_metadata, passages, scores, topk, training=False):
+def filter_results_by_id(
+    batch_metadata, passages, scores, topk, training=False
+):
     """
     Removes retrieved passages from retrieved set if their id is the same as the instance in the batch metadata.
     Useful for MLM or LM where we dont want model to "cheat" by retrieving the passgage it is denoising/generating.
@@ -94,7 +125,9 @@ def filter_results_by_id(batch_metadata, passages, scores, topk, training=False)
     """
 
     if batch_metadata is None:
-        logger.warning("Trying to filter a batch with no metadata - probably a padding instance - just return the topk")
+        logger.warning(
+            "Trying to filter a batch with no metadata - probably a padding instance - just return the topk"
+        )
         return [ps[:topk] for ps in passages], [ss[:topk] for ss in scores]
 
     def _same_passage_chunk(source_metadata, passage):
@@ -102,21 +135,27 @@ def filter_results_by_id(batch_metadata, passages, scores, topk, training=False)
 
     output_passages, output_scores = [], []
 
-    for metadata, passage_li, scores_li in zip(batch_metadata, passages, scores):
+    for metadata, passage_li, scores_li in zip(
+        batch_metadata, passages, scores
+    ):
 
         filtered_passages_and_scores, violating_passages_and_scores = [], []
-        for (p, s) in zip(passage_li, scores_li):
+        for p, s in zip(passage_li, scores_li):
             if not _same_passage_chunk(metadata, p):
                 filtered_passages_and_scores.append((p, s))
             else:
                 violating_passages_and_scores.append((p, s))
 
         if topk > len(filtered_passages_and_scores):
-            logger.warning(f"{len(filtered_passages_and_scores)} passages after filtering for topk = {topk}")
+            logger.warning(
+                f"{len(filtered_passages_and_scores)} passages after filtering for topk = {topk}"
+            )
 
         filtered_passages_and_scores += violating_passages_and_scores
         filtered_passages, filtered_scores = zip(*filtered_passages_and_scores)
         output_passages.append(filtered_passages)
         output_scores.append(filtered_scores)
 
-    return [ps[:topk] for ps in output_passages], [ss[:topk] for ss in output_scores]
+    return [ps[:topk] for ps in output_passages], [
+        ss[:topk] for ss in output_scores
+    ]

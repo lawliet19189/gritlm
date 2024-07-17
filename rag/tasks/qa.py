@@ -1,6 +1,11 @@
 import random
 
-from rag.tasks.evaluation import exact_match_score, match_score, f1_score, normalize_answer
+from rag.tasks.evaluation import (
+    exact_match_score,
+    match_score,
+    f1_score,
+    normalize_answer,
+)
 from rag.tasks.base import BaseTask
 
 
@@ -22,7 +27,7 @@ class Task(BaseTask):
         else:
             target = None
 
-        if not "passages" in example:
+        if "passages" not in example:
             example["passages"] = [{"title": "", "text": ""}]
 
         example["metadata"] = example.get("metadata", {})
@@ -32,9 +37,14 @@ class Task(BaseTask):
 
         return example
 
-    def evaluation(self, prediction, ground_truths):
+    def evaluation(
+        self, prediction: str, ground_truths: list[str]
+    ) -> dict[str, float]:
+        """Computes exact match, match and F1 score between prediction and multiple ground truth."""
         sample_metrics = {
-            "exact_match": exact_match_score(prediction, ground_truths, normalize_answer),
+            "exact_match": exact_match_score(
+                prediction, ground_truths, normalize_answer
+            ),
             "match": match_score(prediction, ground_truths, normalize_answer),
             "f1": f1_score(prediction, ground_truths, normalize_answer),
         }
