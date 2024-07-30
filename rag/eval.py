@@ -12,25 +12,13 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from rag import dist_utils
+from rag.prompt_choices import PromptType
 from rag.index import DistributedIndex, load_or_initialize_index
 from rag.tasks import get_task
 from gritlm import GritLM
 
 
 EMBED_BOS = "<|embed|>\n"
-
-NO_RETRIEVAL = "<|user|>\n{query}\n<|assistant|>\n"
-
-FULL_FORMAT = "<|embed|>\n{query}\n<|user|>\n{title} {text}\n\nOptionally using the prior context answer the query prior to it\n<|assistant|>\n"
-FULL_FORMAT_NO_EMBED = "<|user|>\n{query}\n\n{title} {text}\n\nOptionally using the prior context answer the query prior to it\n<|assistant|>\n"
-
-FULL_FORMAT_DOC = "<|embed|>\n{title} {text}\n<|user|>\n{query}\n\nAnswer the prior query while optionally using the context prior to it\n<|assistant|>\n"
-FULL_FORMAT_NO_EMBED_DOC = "<|user|>\n{title} {text}\n\n{query}\n\nAnswer the prior query while optionally using the context prior to it\n<|assistant|>\n"
-
-CACHE_FORMAT_QUERY = "\n<|user|>\n{title} {text}\n\nOptionally using the prior context answer the query prior to it\n<|assistant|>\n"
-CACHE_FORMAT_DOC = "\n<|user|>\n{query}\n\nAnswer the prior query while optionally using the context prior to it\n<|assistant|>\n"
-CACHE_FORMAT_DOC_QUERY = "\n<|user|>\nAnswer the prior query while optionally using the context prior to it\n<|assistant|>\n"
-CACHE_FORMAT_QUERY_DOC = "\n<|user|>\nOptionally using the prior context answer the query prior to it\n<|assistant|>\n"
 
 PROMPT = "The answer is"
 # PROMPT = "Sure, the answer is"
@@ -88,7 +76,7 @@ def get_args():
         "--task",
         type=str,
         default="qa",
-        choices=["qa"],
+        choices=["qa", "multiple_choice"],
     )
     parser.add_argument(
         "--n_context",
@@ -164,6 +152,31 @@ def get_args():
     )
     parser.add_argument(
         "--latency", action="store_true", help="Move doc cache to cpu"
+    )
+    # Multiple Choice task options:
+    parser.add_argument(
+        "--multiple_choice_num_options",
+        type=int,
+        default=4,
+        help="How many choice options for multiple choice QA (MMLU is 4)",
+    )
+    parser.add_argument(
+        "--multiple_choice_train_permutations",
+        choices=["single", "cyclic", "all"],
+        default="single",
+        type=str,
+        help="Whether to train with answer order permutations When training on multiple choice (e.g. MMLU)."
+        " Can improve results by de-biasing models's preferences for arbitrary answer orderings. Recommend training with 'all'. "
+        "single: no permutations. cyclic: cyclic permutations. all: all possible answer order permutations'",
+    )
+    parser.add_argument(
+        "--multiple_choice_eval_permutations",
+        choices=["single", "cyclic", "all"],
+        default="single",
+        type=str,
+        help="Whether to evaluate with answer order permutations for multiple choice (e.g. MMLU)."
+        " Can improve results by de-biasing models's preferences for arbitrary answer orderings. Best results with 'all' but very slow. 'cyclic' is a good compromise. "
+        "single: no permutations. cyclic: cyclic permutations. all: all possible answer order permutations'",
     )
     return parser.parse_args()
 
@@ -268,6 +281,10 @@ def evaluate(
     for i, batch in enumerate(tqdm(data_iterator)):
         query: list[str] = batch.get("query", [""])
         answers: list[list[str]] = batch.get("answers", [[""]])
+        extra_kwargs: dict[str, Any] = {}
+        if args.task == "multiple_choice":
+            options = batch.get("options", [""])
+            extra_kwargs["options"] = options
 
         batch_metadata = batch.get("metadata")
         target_tokens = batch.get("target_tokens")
@@ -330,9 +347,17 @@ def evaluate(
                 time_to_remove = time.time() - time_to_remove
 
             if args.cache == "query":
-                inputs = CACHE_FORMAT_QUERY.format(**passages[0][0])
+                inputs = task.get_formatted_task_prompt(
+                    text_and_metadata=passages[0][0],
+                    prompt_type=PromptType.CACHE_FORMAT_QUERY,
+                    **extra_kwargs,
+                )
             elif args.cache == "doc":
-                inputs = CACHE_FORMAT_DOC.format(query=query[0])
+                inputs = task.get_formatted_task_prompt(
+                    question=query[0],
+                    prompt_type=PromptType.CACHE_FORMAT_DOC,
+                    **extra_kwargs,
+                )
                 kv_cache = [
                     (
                         passages[0][0]["kv_cache"][i][0].to(query_emb.device),
@@ -341,7 +366,9 @@ def evaluate(
                     for i in range(len(passages[0][0]["kv_cache"]))
                 ]
             elif args.cache == "docquery":
-                inputs = CACHE_FORMAT_DOC_QUERY
+                inputs = task.get_prompt_format(
+                    PromptType.CACHE_FORMAT_DOC_QUERY
+                )
                 # Concat the doc kv cache prior to the query kv cache
                 # Inaccuracy is that the query kv cache is not conditioned on the doc kv cache
                 kv_cache = [
@@ -356,7 +383,9 @@ def evaluate(
                     for i, layer in enumerate(kv_cache)
                 ]
             elif args.cache == "querydoc":
-                inputs = CACHE_FORMAT_QUERY_DOC
+                inputs = task.get_prompt_format(
+                    prompt_type=PromptType.CACHE_FORMAT_QUERY_DOC
+                )
                 # Concat the query cache prior to the doc kv cache
                 # Inaccuracy is that the doc kv cache is not conditioned on the query kv cache
                 kv_cache = [
@@ -371,27 +400,44 @@ def evaluate(
                     for i, layer in enumerate(kv_cache)
                 ]
             elif args.cache is None:
+
                 if args.prompt == "queryemb":
-                    inputs = FULL_FORMAT.format(
-                        query=query[0], **passages[0][0]
+                    inputs = task.get_formatted_task_prompt(
+                        question=query[0],
+                        prompt_type=PromptType.FULL_FORMAT,
+                        text_and_metadata=passages[0][0],
+                        **extra_kwargs,
                     )
                 elif args.prompt == "docemb":
-                    inputs = FULL_FORMAT_DOC.format(
-                        query=query[0], **passages[0][0]
+                    inputs = task.get_formatted_task_prompt(
+                        question=query[0],
+                        prompt_type=PromptType.FULL_FORMAT_DOC,
+                        text_and_metadata=passages[0][0],
+                        **extra_kwargs,
                     )
                 elif args.prompt in ("query", "default"):
-                    inputs = FULL_FORMAT_NO_EMBED.format(
-                        query=query[0], **passages[0][0]
+                    inputs = task.get_formatted_task_prompt(
+                        question=query[0],
+                        prompt_type=PromptType.FULL_FORMAT_NO_EMBED,
+                        text_and_metadata=passages[0][0],
+                        **extra_kwargs,
                     )
                 elif args.prompt == "doc":
-                    inputs = FULL_FORMAT_NO_EMBED_DOC.format(
-                        query=query[0], **passages[0][0]
+                    inputs = task.get_formatted_task_prompt(
+                        question=query[0],
+                        prompt_type=PromptType.FULL_FORMAT_NO_EMBED_DOC,
+                        text_and_metadata=passages[0][0],
+                        **extra_kwargs,
                     )
             else:
                 raise ValueError(f"Cache type {args.cache} not supported")
         else:
             kv_cache = None
-            inputs = NO_RETRIEVAL.format(query=query[0])
+            inputs = task.get_formatted_task_prompt(
+                question=query[0],
+                prompt_type=PromptType.NO_RETRIEVAL,
+                **extra_kwargs,
+            )
 
         inputs += PROMPT
 

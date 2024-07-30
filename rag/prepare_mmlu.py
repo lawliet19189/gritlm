@@ -12,7 +12,7 @@ import random
 import tarfile
 from pathlib import Path
 
-from download_tools import maybe_download_file
+from rag.download_tools import maybe_download_file
 
 DATA_URL = "https://people.eecs.berkeley.edu/~hendrycks/data.tar"
 

@@ -1,8 +1,10 @@
 import json
 import logging
 import random
+from abc import abstractmethod
 from collections import defaultdict
-from typing import Any, Generator
+from typing import Any, Generator, Optional
+from rag.prompt_choices import PromptType
 
 from rag.tasks.evaluation import exact_match_score
 
@@ -89,29 +91,19 @@ class BaseTask(object):
         for x in d:
             yield x
 
-    def process(self, example, *args, **kwargs):
-        """most basic example processing, should be overwritten in subclasses"""
-        assert (
-            "target" in example
-        ), "base task requires a `target` field string to be defined"
-        assert (
-            "query" in example
-        ), "base task requires a `query` field string to be defined"
-        assert (
-            type(example["target"]) == str
-        ), "base task requires a `target` field string to be defined"
-        assert (
-            type(example["query"]) == str
-        ), "base task requires a `query` field string to be defined"
-
-        if not "passages" in example:
-            example["passages"] = [{"title": "", "text": ""}]
-
-        return example
-
     def evaluation_postprocessing(self, metrics, dataset_with_predictions):
         """do any necessary postprocessing of generated predictions or metrics after the evaluation loop"""
         return metrics, dataset_with_predictions
+
+    @abstractmethod
+    def get_formatted_task_prompt(
+        self,
+        text_and_metadata: dict[str, Any],  # TODO: support list of passages
+        question: str,
+        prompt_type: PromptType,
+        choices: Optional[dict[str, Any]] = None,
+    ) -> str:
+        """Returns the formatted task prompt"""
 
 
 def filter_results_by_id(
