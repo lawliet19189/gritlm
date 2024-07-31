@@ -34,20 +34,18 @@ python -m rag.prepare_qa --output_directory rag/
 #### MMLU:
 
 ```base
-python -m rag.prepare_mmlu --output_directory rag/
-mv rag/data/mmlu_data rag/mmlu_data
-rm -rf rag/data rag/mmlu_data/data.tar
+python -m rag.prepare_mmlu --output_directory rag/ && mv rag/data/mmlu_data rag/mmlu_data && rm -rf rag/data rag/mmlu_data/data.tar
 ```
-
-### Benchmarking
-
-To run the latency benchmark, do `bash scripts/raglatency.sh` after adjusting the script to your cluster / paths. For performance benchmarking, you can adapt & run the scripts below:
 
 Note: The test data for the respective RAG datasets are as follows:
 
 - NaturalQuestions: `rag/nq_data/test.jsonl`
 - TriviaQA: `rag/triviaqa_data/test.jsonl`
 - MMLU: `rag/mmlu_data/5-shot/combined_test.jsonl`
+
+### Benchmarking
+
+To run the latency benchmark, do `bash scripts/raglatency.sh` after adjusting the script to your cluster / paths. For performance benchmarking, you can adapt & run the scripts below:
 
 No retrieval:
 
