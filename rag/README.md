@@ -21,50 +21,74 @@ wget -O - https://huggingface.co/datasets/BeIR/nq/resolve/main/corpus.jsonl.gz |
 python -m rag.eval --model_name_or_path GritLM/gritlm-7b --eval_data rag/nq_data/test.jsonl --passages corpus.jsonl --save_index_path index_nq
 ```
 
+### Evaluation Data
+
+To run evaluation on Natural Questions, TriviaQA, or MMLU, it is necessary to download and preprocess the data. Run the following to accomplish this:
+
+#### NaturalQuestions & TriviaQA (Ignore if you had built the index previously, since this step would be redundant):
+
+```base
+python -m rag.prepare_qa --output_directory rag/
+```
+
+#### MMLU:
+
+```base
+python -m rag.prepare_mmlu --output_directory rag/
+mv rag/data/mmlu_data rag/mmlu_data
+rm -rf rag/data rag/mmlu_data/data.tar
+```
+
 ### Benchmarking
 
 To run the latency benchmark, do `bash scripts/raglatency.sh` after adjusting the script to your cluster / paths. For performance benchmarking, you can adapt & run the scripts below:
 
+Note: The test data for the respective RAG datasets are as follows:
+
+- NaturalQuestions: `rag/nq_data/test.jsonl`
+- TriviaQA: `rag/triviaqa_data/test.jsonl`
+- MMLU: `rag/mmlu_data/5-shot/combined_test.jsonl`
+
 No retrieval:
 
 ```bash
-python gritlm/rag/eval.py --model_name_or_path GritLM/gritlm-7b --eval_data gritlm/rag/nq_data/test.jsonl --no_retrieval --load_index_path index_nq --cache query
+python -m rag.eval --model_name_or_path GritLM/gritlm-7b --eval_data rag/nq_data/test.jsonl --no_retrieval --load_index_path index_nq --cache query
 ```
 
 Query then document prompt RAG:
 
 ```bash
-python gritlm/rag/eval.py --model_name_or_path GritLM/gritlm-7b --eval_data gritlm/rag/nq_data/test.jsonl --passages /data/niklas/gritlm/rag/corpora/nqbeir/corpus.jsonl --load_index_path index_nq --prompt query
+python -m rag.eval --model_name_or_path GritLM/gritlm-7b --eval_data rag/nq_data/test.jsonl --passages corpus.jsonl --load_index_path index_nq --prompt query
 ```
 
 Query Caching
 
 ```bash
-python gritlm/rag/eval.py --model_name_or_path GritLM/gritlm-7b --eval_data gritlm/rag/nq_data/test.jsonl --passages /data/niklas/gritlm/rag/corpora/nqbeir/corpus.jsonl --load_index_path index_nq --cache query
+python -m rag.eval --model_name_or_path GritLM/gritlm-7b --eval_data rag/nq_data/test.jsonl --passages corpus.jsonl --load_index_path index_nq --cache query
 ```
 
 Query-Doc Caching
 
 ```bash
-python gritlm/rag/eval.py --model_name_or_path GritLM/gritlm-7b --eval_data gritlm/rag/nq_data/test.jsonl --passages /data/niklas/gritlm/rag/corpora/nqbeir/corpus.jsonl --load_index_path index_nq --cache querydoc
+python -m rag.eval --model_name_or_path GritLM/gritlm-7b --eval_data rag/nq_data/test.jsonl --passages corpus.jsonl --load_index_path index_nq --cache querydoc
 ```
 
 Document then query prompt RAG:
 
 ```bash
-python gritlm/rag/eval.py --model_name_or_path GritLM/gritlm-7b --eval_data gritlm/rag/nq_data/test.jsonl --passages /data/niklas/gritlm/rag/corpora/nqbeir/corpus.jsonl --load_index_path index_nq --prompt doc
+python -m rag.eval --model_name_or_path GritLM/gritlm-7b --eval_data rag/nq_data/test.jsonl --passages corpus.jsonl --load_index_path index_nq --prompt doc
 ```
 
 Doc Caching:
 
 ```bash
-python gritlm/rag/eval.py --model_name_or_path GritLM/gritlm-7b --eval_data gritlm/rag/nq_data/test.jsonl --passages /data/niklas/gritlm/rag/corpora/nqbeir/corpus.jsonl --load_index_path index_nq --cache doc
+python -m rag.eval --model_name_or_path GritLM/gritlm-7b --eval_data rag/nq_data/test.jsonl --passages corpus.jsonl --load_index_path index_nq --cache doc
 ```
 
 Doc-Query Caching
 
 ```bash
-python gritlm/rag/eval.py --model_name_or_path GritLM/gritlm-7b --eval_data gritlm/rag/nq_data/test.jsonl --passages /data/niklas/gritlm/rag/corpora/nqbeir/corpus.jsonl --load_index_path index_nq --cache docquery
+python -m rag.eval --model_name_or_path GritLM/gritlm-7b --eval_data rag/nq_data/test.jsonl --passages corpus.jsonl --load_index_path index_nq --cache docquery
 ```
 
 ### Acknowledgements
