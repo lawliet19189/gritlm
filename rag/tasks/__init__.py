@@ -1,6 +1,8 @@
-from . import base, qa
+from . import base, qa, multiple_choice
 
-AVAILABLE_TASKS = {m.__name__.split(".")[-1]: m for m in [base, qa]}
+AVAILABLE_TASKS = {
+    m.__name__.split(".")[-1]: m for m in [base, qa, multiple_choice]
+}
 
 
 def get_task(opt, tokenizer) -> base.BaseTask:

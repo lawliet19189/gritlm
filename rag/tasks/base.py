@@ -84,6 +84,26 @@ class BaseTask(object):
         }
         return sample_metrics
 
+    def process(self, example, *args, **kwargs):
+        """most basic example processing, should be overwritten in subclasses"""
+        assert (
+            "target" in example
+        ), "base task requires a `target` field string to be defined"
+        assert (
+            "query" in example
+        ), "base task requires a `query` field string to be defined"
+        assert (
+            type(example["target"]) == str
+        ), "base task requires a `target` field string to be defined"
+        assert (
+            type(example["query"]) == str
+        ), "base task requires a `query` field string to be defined"
+
+        if not "passages" in example:
+            example["passages"] = [{"title": "", "text": ""}]
+
+        return example
+
     @staticmethod
     def shuffle_iterator(dataset):
         d = list(dataset)

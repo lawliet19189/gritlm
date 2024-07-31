@@ -231,7 +231,7 @@ def build_index(
 
 
 def _get_eval_data_iterator(args, data_path, task) -> list[dict[str, Any]]:
-    data_iterator = task.data_iterator(data_path)
+    data_iterator = task.data_iterator(data_path, opt=args)
     data_iterator = filter(None, map(task.process, data_iterator))
     data_iterator = list(
         task.batch_iterator(data_iterator, args.per_gpu_batch_size)
@@ -283,8 +283,8 @@ def evaluate(
         answers: list[list[str]] = batch.get("answers", [[""]])
         extra_kwargs: dict[str, Any] = {}
         if args.task == "multiple_choice":
-            options = batch.get("options", [""])
-            extra_kwargs["options"] = options
+            options = batch.get("options", [{}])
+            extra_kwargs["choices"] = options[0]
 
         batch_metadata = batch.get("metadata")
         target_tokens = batch.get("target_tokens")

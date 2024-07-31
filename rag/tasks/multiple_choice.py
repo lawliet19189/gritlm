@@ -9,13 +9,14 @@ import itertools
 import string
 from typing import Any, Optional
 
-import torch
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-
 from rag.prompt_choices import PromptType
-from rag.tasks.evaluation import exact_match_score
+from rag.tasks.evaluation import (
+    exact_match_score,
+    f1_score,
+    match_score,
+    normalize_answer,
+)
 
-# from rag.options import Options
 from rag.tasks.base import BaseTask
 
 
@@ -33,16 +34,9 @@ def _get_permutation_orderings(N, permutations_type):
 class Task(BaseTask):
     metrics = ["debiased_accuracy", "accuracy", "eval_loss"]
 
-    def __init__(
-        self, opt, tokenizer: PreTrainedTokenizerBase, *args, **kwargs
-    ):
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.maximum_question_length = 356
+    def __init__(self, opt, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.choices = string.ascii_uppercase[: opt.multiple_choice_num_options]
-        self.choice2index = {
-            o: self.tokenizer(o)["input_ids"][0] for o in self.choices
-        }
 
     @staticmethod
     def get_prompt_format(prompt_type: PromptType) -> str:
@@ -138,73 +132,40 @@ class Task(BaseTask):
                 yield permed_item
 
     def evaluation(self, prediction, ground_truths):
+        """Computes exact match, match and F1 score between prediction and multiple ground truth."""
         sample_metrics = {
-            "accuracy": exact_match_score(prediction, ground_truths)
+            "exact_match": exact_match_score(
+                prediction, ground_truths, normalize_answer
+            ),
+            "match": match_score(prediction, ground_truths, normalize_answer),
+            "f1": f1_score(prediction, ground_truths, normalize_answer),
         }
         return sample_metrics
 
-    def get_choice_logits(self, logits):
-        prediction_logits = {
-            letter: logits[1, letter_index].cpu().item()
-            for letter, letter_index in self.choice2index.items()
+    @staticmethod
+    def _answer_formatter(example) -> dict[str, Any]:
+        for option_letter, option_desc in example["options"].items():
+            # 'answer' contains only the letter.
+            if example["answer"] == option_letter:
+                example["answer"] = f"{option_letter}. {option_desc}."
+                break
+        return example
+
+    def process(self, example, *args, **kwargs) -> dict[str, Any]:
+        assert (
+            "question" in example
+        ), "multiple_choice task requires a `question` field string to be defined"
+        assert (
+            "options" in example
+        ), "multiple_choice task requires a `options` field string to be defined"
+
+        example = Task._answer_formatter(example)
+
+        return {
+            "query": example["question"],
+            "options": example["options"],
+            "choices": self.choices,
+            "passages": [{"title": "", "text": ""}],
+            "answers": [example["answer"]],
+            "metadata": example,
         }
-        return prediction_logits
-
-    def _get_original_instance(self, permutations):
-        return [p for p in permutations if p["metadata"]["is_original"]][0]
-
-    def _marginalize_across_permutations(self, permutations):
-        original_instance = self._get_original_instance(permutations)
-        text_answer_2_letter = {
-            v: k for k, v in original_instance["metadata"]["options"].items()
-        }
-
-        aggregate_probs = {}
-        for perm in permutations:
-            logits = torch.tensor(
-                [perm["choice_logits"][c] for c in self.choices]
-            )
-            probs = torch.softmax(logits, dim=0).tolist()
-            perm_text_options = [
-                perm["metadata"]["options"][c] for c in self.choices
-            ]
-            for t, p in zip(perm_text_options, probs):
-                aggregate_probs.setdefault(t, []).append(p)
-
-        marginalized = {
-            text_answer_2_letter[t]: torch.tensor(v).mean().item()
-            for t, v in aggregate_probs.items()
-        }
-        return marginalized, aggregate_probs
-
-    def _reduce_permutations(self, dataset_wpred):
-        to_agg = {}
-        for output in dataset_wpred:
-            to_agg.setdefault(output["metadata"]["uid"], []).append(output)
-
-        output_dataset_wpred = []
-        for _, perms in to_agg.items():
-            original_instance = copy.deepcopy(
-                self._get_original_instance(perms)
-            )
-            scores, all_scores = self._marginalize_across_permutations(perms)
-            del original_instance["choice_logits"]
-            original_instance["choice_probs"] = scores
-            original_instance["generation"] = max(
-                scores.items(), key=lambda x: x[1]
-            )[0]
-            original_instance["choice_probs"] = scores
-            original_instance["all_probs"] = all_scores
-            original_instance["permutations"] = perms
-            output_dataset_wpred.append(original_instance)
-        return output_dataset_wpred
-
-    def evaluation_postprocessing(self, metrics, dataset_with_predictions):
-        dataset_with_predictions = self._reduce_permutations(
-            dataset_with_predictions
-        )
-        metrics["debiased_accuracy"] = [
-            float(d["generation"] == d["metadata"]["answer"])
-            for d in dataset_with_predictions
-        ]
-        return metrics, dataset_with_predictions
