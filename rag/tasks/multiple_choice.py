@@ -32,7 +32,7 @@ def _get_permutation_orderings(N, permutations_type):
 
 
 class Task(BaseTask):
-    metrics = ["debiased_accuracy", "accuracy", "eval_loss"]
+    metrics = ["exact_match", "match", "f1", "eval_loss"]
 
     def __init__(self, opt, *args, **kwargs):
         super().__init__(*args, **kwargs)
