@@ -55,6 +55,25 @@ class Task(BaseTask):
             **text_and_metadata,
         )
 
+    def process(self, example, *args, **kwargs):
+
+        if "target" in example:
+            target = example["target"]
+        elif "answers" in example:
+            target = random.choice(example["answers"])
+        else:
+            target = None
+
+        if "passages" not in example:
+            example["passages"] = [{"title": "", "text": ""}]
+
+        example["metadata"] = example.get("metadata", {})
+        example["query"] = example["question"]
+        if target is not None:
+            example["target"] = target
+
+        return example
+
     def evaluation(
         self, prediction: str, ground_truths: list[str]
     ) -> dict[str, float]:
