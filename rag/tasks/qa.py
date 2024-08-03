@@ -43,17 +43,19 @@ class Task(BaseTask):
 
     def get_formatted_task_prompt(
         self,
-        text_and_metadata: dict[str, Any],  # TODO: support list of passages
-        question: str,
         prompt_type: PromptType,
+        text_and_metadata: dict[str, Any] = None,  # TODO: support list of passages
+        question: str = None,
         choices: Optional[dict[str, Any]] = None,  # type: ignore
     ) -> str:
         """Returns the formatted task prompt"""
         unformatted_prompt = Task.get_prompt_format(prompt_type)
-        return unformatted_prompt.format(
-            query=question,
-            **text_and_metadata,
-        )
+        format_kwargs = {}
+        if text_and_metadata:
+            format_kwargs.update(text_and_metadata)
+        if question:
+            format_kwargs["query"] = question
+        return unformatted_prompt.format(**format_kwargs)
 
     def process(self, example, *args, **kwargs):
 
