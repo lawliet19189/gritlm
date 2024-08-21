@@ -192,6 +192,9 @@ def build_index(
 ):
     n_batch = math.ceil(len(passages) / gpu_embedder_batch_size)
     total = 0
+    logger.info(f"Build Index:\nBatch Size: {gpu_embedder_batch_size}\nTotal: {total}\ncache: {cache}")
+    progress = tqdm()
+    progress.total = n_batch
     for i in range(n_batch):
         batch = passages[
             i * gpu_embedder_batch_size : (i + 1) * gpu_embedder_batch_size
@@ -220,14 +223,21 @@ def build_index(
                 convert_to_tensor=True,
                 instruction=gritlm_instruction_format(),
             )
-        index.embeddings[:, total : total + len(embeddings)] = embeddings.T.to(
-            index.dtype
-        ).cpu()
+        index.embeddings[:, total : total + len(embeddings)] = embeddings.T
+        #.to(
+        #    index.dtype
+        #).cpu()
         total += len(embeddings)
-        if i % 500 == 0 and i > 0:
-            logger.info(f"Number of passages encoded: {total}")
+        progress.update(1)
+        # if i % 500 == 0 and i > 0:
+        #     logger.info(f"Number of passages encoded: {total}")
+    progress.close()
     dist_utils.barrier()
     logger.info(f"{total} passages encoded on process: {dist_utils.get_rank()}")
+    
+    if not index.is_index_trained():
+        logger.info(f"Train faiss indices")
+        index.train_index()
 
 
 def _get_eval_data_iterator(args, data_path, task) -> list[dict[str, Any]]:
