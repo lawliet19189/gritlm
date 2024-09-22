@@ -7,8 +7,10 @@ from datasets import load_dataset
 from tqdm import tqdm
 import logging
 
+logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+
 
 def parse_args():
     parser = ArgumentParser()
@@ -260,7 +262,16 @@ def prepare_corpus_dataset(corpus_data_path: str, corpus_size: int, shuffle: boo
         line = f.readline()
 
         while line and len(lines) < corpus_size:
-            line = json.loads(f.readline())
+            try:
+                if isinstance(line, str):
+                    line = json.loads(line.strip())
+                elif isinstance(line, dict):
+                    pass
+                else:
+                    raise ValueError(f"Invalid line type: {type(line)}")
+            except json.JSONDecodeError as e:
+                logger.exception(f"({corpus_data_path}) Error decoding line: {line}")
+                raise e
 
             # tokenize the line and split it by half
             first_half, second_half = split_text(line['text'])
@@ -289,8 +300,9 @@ def prepare_replug_data(args):
 
     corpus_split = args.corpus_split
     instruction_split = 1 - corpus_split
-    max_corpus_size = int(args.max_train_size * corpus_split)
-    max_instruction_size = int(args.max_train_size * instruction_split)
+    desired_passages = args.max_train_size if args.max_train_size is not None else total_size
+    max_corpus_size = int(desired_passages * corpus_split)
+    max_instruction_size = int(desired_passages * instruction_split)
 
 
     logger.info("Preparing dataset...")
