@@ -10,9 +10,15 @@ import torch
 import torch.distributed as dist
 from transformers import AutoConfig, AutoTokenizer, HfArgumentParser, Trainer, set_seed
 
+from rag.index_io import load_passages
+from rag.index_v2 import DistributedFAISSIndex
+from rag.passage_encoder import custom_jsonl_transformer
+
 from .arguments import CustomTrainingArguments, DataArguments, ModelArguments
 from .data import CustomCollator, CustomDataset, CustomRandomSampler
-from .model import GritLMTrainModel
+from .model import GritLMTrainModel, GritLMREPLUGModel
+
+from gritlm.gritlm import GritLM
 
 BASE_BOS: str = "<s>"
 TURN_SEP: str = "\n"
@@ -27,6 +33,8 @@ EMBED_EOS: str = ""
 
 ASSISTANT_BOS: str = "\n<|assistant|>\n"
 ASSISTANT_EOS: str = "</s>"
+
+# os.environ["WANDB_MODE"] = "disabled"
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +98,13 @@ def main():
     # Set seed
     set_seed(training_args.seed)
 
-    # If embedding/unified, handle grad accumulation manually inside forward of GradCacheTrainer.
+    # If embedding/unified/replug, handle grad accumulation manually inside forward of GradCacheTrainer.
     gc_chunk_size = None
     if ((training_args.gradient_accumulation_steps > 1) and \
         (training_args.negatives_cross_device) and \
-        (training_args.mode in ["embedding", "unified"])) or \
+        (training_args.mode in ["embedding", "unified", "replug"])) or \
         (training_args.no_gen_gas and training_args.no_emb_gas):
+
         gc_chunk_size = training_args.per_device_train_batch_size
         training_args.per_device_train_batch_size = \
             training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps
@@ -114,10 +123,32 @@ def main():
         num_labels=1,
     )
     logger.info('Config: %s', config)
-    
+
     if not(tokenizer.pad_token) and tokenizer.bos_token:
         tokenizer.pad_token = tokenizer.bos_token
         logger.info('Set pad token to bos token: %s', tokenizer.pad_token)   
+    
+    if training_args.mode == "replug":
+        assert data_args.index_path is not None, "Index path must be provided for RAG training"
+        assert data_args.index_passages_path is not None, "Index passages path must be provided for RAG training"
+        assert data_args.index_type is not None, "Index type must be provided for RAG training"
+        assert data_args.code_size is not None, "Code size must be provided for RAG training"
+        assert data_args.num_passages is not None, "Number of passages must be provided for RAG training"
+
+        parent_tokenizer = AutoTokenizer.from_pretrained(
+            model_args.parent_model_name_or_path,
+            padding_side="right", # Has to be right so masking of instruction tokens works correctly
+        )
+        parent_config = AutoConfig.from_pretrained(
+            model_args.parent_model_name_or_path,
+            num_labels=1,
+        )
+        logger.info('Prent Config: %s', parent_config)
+
+        if not(parent_tokenizer.pad_token) and parent_tokenizer.bos_token:
+            parent_tokenizer.pad_token = parent_tokenizer.bos_token
+            logger.info('Set pad token to bos token for parent: %s', parent_tokenizer.pad_token)
+    
 
     data_files = [os.path.join(data_args.train_data, x) for x in os.listdir(data_args.train_data)] if \
         os.path.isdir(data_args.train_data) else [data_args.train_data]
@@ -146,7 +177,7 @@ def main():
             )
         # Check if has instructions separated such that they will be masked out later
         # If so filter out samples where the instructions are too long else they will all be 0s
-        if training_args.mode in ["embedding", "unified"] and "query" in tmp_ds.features:
+        if training_args.mode in ["embedding", "unified", "replug"] and "query" in tmp_ds.features:
             if isinstance(tmp_ds[0]['query'], (tuple, list)):
                 logger.info(f"Filtering out embedding samples with too long instructions for {file}")
                 tmp_ds = filter_too_long_instructions(
@@ -164,7 +195,7 @@ def main():
             ds_name_to_samples[file.split("/")[-1]] = len(tmp_ds)
             train_ds.append(tmp_ds)
             continue
-        if training_args.mode in ["unified", "generative"] and "text" in tmp_ds.features:
+        if training_args.mode in ["unified", "generative", "replug"] and "text" in tmp_ds.features:
             if isinstance(tmp_ds[0]['text'], (tuple, list)):
                 logger.info(f"Filtering out generative samples with too long instructions for {file}")
                 # Use passage_max_len, as this is the seq len limit for the entire generative snippet
@@ -185,6 +216,9 @@ def main():
     elif training_args.mode == "generative":
         ds = datasets.concatenate_datasets(train_ds)
         logger.info("Generative mode: %d samples", len(ds))
+    elif training_args.mode == "replug":
+        ds = datasets.concatenate_datasets(train_ds)
+        logger.info("Replug mode: %d samples", len(ds))
     elif training_args.mode == "unified":
         ds_embedding = datasets.concatenate_datasets([
             t for t in train_ds if "query" in t.features
@@ -224,25 +258,72 @@ def main():
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
 
-    model = GritLMTrainModel(
-        model_name_or_path=model_args.model_name_or_path,
-        normalized=model_args.normalized,
-        pooling_method=model_args.pooling_method,
-        negatives_cross_device=training_args.negatives_cross_device,
-        temperature=training_args.temperature,
-        mode=training_args.mode,
-        projection=model_args.projection,
-        attn=model_args.attn,
-        attn_implementation=model_args.attn_implementation,
-        torch_dtype=args_to_dtype(training_args),
-        loss_gen_type=training_args.loss_gen_type,
-        loss_gen_factor=training_args.loss_gen_factor,
-        use_cache=False,
-        # Critical to make Mixtral work
-        low_cpu_mem_usage=True,
-        quantization_config=quantization_config,
-        load_in_4bit=load_in_4bit,
-    )
+    if training_args.mode == "replug":
+        index = DistributedFAISSIndex(data_args.index_type, data_args.code_size)
+        all_passages = load_passages(data_args.index_passages_path, data_args.index_passages_num, custom_jsonl_transformer)
+        index.load_faiss_index(data_args.index_path, all_passages)
+
+        logger.info("Loading parent model")
+        frozen_model = GritLM(
+            model_name_or_path=model_args.parent_model_name_or_path,
+            mode="generative",
+            pooling_method=model_args.pooling_method,
+            normalized=model_args.normalized,
+            projection=model_args.projection,
+            attn=model_args.attn,
+            attn_implementation=model_args.attn_implementation,
+            is_inference=True,
+            # negatives_cross_device=training_args.negatives_cross_device,
+            temperature=training_args.parent_temperature,
+            torch_dtype=torch.bfloat16, # TODO: Make this configurable
+            load_in_4bit=True,
+            use_cache=False,
+            low_cpu_mem_usage=True,
+        )
+        logger.info("Loading REPLUG model")
+        model = GritLMREPLUGModel(
+            model_name_or_path=model_args.model_name_or_path,
+            normalized=model_args.normalized,
+            pooling_method=model_args.pooling_method,
+            # negatives_cross_device=training_args.negatives_cross_device,
+            temperature=training_args.temperature,
+            mode=training_args.mode,
+            projection=model_args.projection,
+            attn=model_args.attn,
+            attn_implementation=model_args.attn_implementation,
+            torch_dtype=args_to_dtype(training_args),
+            loss_gen_type=training_args.loss_gen_type,
+            loss_gen_factor=training_args.loss_gen_factor,
+            use_cache=False,
+            # Critical to make Mixtral work
+            low_cpu_mem_usage=True,
+            quantization_config=quantization_config,
+            load_in_4bit=load_in_4bit,
+            parent_model=frozen_model,
+            index=index,
+            num_passages=data_args.num_passages,
+            tokenizer=tokenizer,
+        )
+    else:
+        model = GritLMTrainModel(
+            model_name_or_path=model_args.model_name_or_path,
+            normalized=model_args.normalized,
+            pooling_method=model_args.pooling_method,
+            negatives_cross_device=training_args.negatives_cross_device,
+            temperature=training_args.temperature,
+            mode=training_args.mode,
+            projection=model_args.projection,
+            attn=model_args.attn,
+            attn_implementation=model_args.attn_implementation,
+            torch_dtype=args_to_dtype(training_args),
+            loss_gen_type=training_args.loss_gen_type,
+            loss_gen_factor=training_args.loss_gen_factor,
+            use_cache=False,
+            # Critical to make Mixtral work
+            low_cpu_mem_usage=True,
+            quantization_config=quantization_config,
+            load_in_4bit=load_in_4bit,
+        )
     # Add special token for embed
     if model_args.pooling_method == "lasttoken":
         embed_eos = "</e>"
@@ -310,7 +391,9 @@ def main():
             embed_eos=embed_eos,
             assistant_bos=ASSISTANT_BOS,
             assistant_eos=ASSISTANT_EOS,
-            prefixlm=data_args.prefixlm
+            prefixlm=data_args.prefixlm,
+            mode=training_args.mode,
+            max_embed_len=model_args.emb_dim,
         ),
         "tokenizer": tokenizer,
     }

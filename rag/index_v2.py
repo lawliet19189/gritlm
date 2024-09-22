@@ -8,15 +8,18 @@ import os
 import pickle
 import logging
 from typing import Optional, Tuple, Union
+
+from tqdm import tqdm
 import faiss
 import faiss.contrib.torch_utils
 import numpy as np
 import torch
 from rag.utils import *
 
+
 logger = logging.getLogger(__name__)
 
-EMBEDDINGS_DIM = 4096
+EMBEDDINGS_DIM = 512#4096
 EMBEDDING_DTYPE = torch.float16
 
 FAISSGPUIndex = Union[
@@ -48,16 +51,20 @@ def deserialize_listdocs(ids):
 
 
 class DistributedIndex(object):
-    def __init__(self):
+    def __init__(self,
+                 dtype=EMBEDDING_DTYPE,
+        **kwargs):
         self.embeddings = None
         self.doc_map = dict()
-        self.is_in_gpu = True
+        self.is_in_gpu = True if torch.cuda.is_available() else False
+        self.dtype = EMBEDDING_DTYPE
+        self.dtype = dtype
 
     def init_embeddings(self, passages, dim: Optional[int] = EMBEDDINGS_DIM):
         self.doc_map = {i: doc for i, doc in enumerate(passages)}
         self.embeddings = torch.zeros(dim, (len(passages)), dtype=EMBEDDING_DTYPE)
-        if self.is_in_gpu:
-            self.embeddings = self.embeddings.cuda()
+        # if self.is_in_gpu:
+        #     self.embeddings = self.embeddings.cuda()
 
     def _get_saved_embedding_path(self, save_dir: str, shard: int) -> str:
         return os.path.join(save_dir, f"embeddings.{shard}.pt")
@@ -113,48 +120,96 @@ class DistributedIndex(object):
             )
             torch.save(embeddings_shard, embedding_shard_path)
 
+    # def load_index(self, path: str, total_saved_shards: int):
+    #     """
+    #     Loads sharded embeddings and passages files (no index is loaded).
+    #     """
+    #     rank = get_rank()
+    #     ws = get_world_size()
+    #     assert (
+    #         total_saved_shards % ws == 0
+    #     ), f"N workers must be a multiple of shards to save"
+    #     shards_per_worker = total_saved_shards // ws
+    #     passages = []
+    #     embeddings = []
+    #     for shard_id in range(
+    #         rank * shards_per_worker, (rank + 1) * shards_per_worker
+    #     ):
+    #         passage_shard_path = self._get_saved_passages_path(path, shard_id)
+    #         with open(passage_shard_path, "rb") as fobj:
+    #             passages.append(pickle.load(fobj))
+    #         embeddings_shard_path = self._get_saved_embedding_path(
+    #             path, shard_id
+    #         )
+    #         embeddings.append(
+    #             torch.load(embeddings_shard_path, map_location="cpu").cuda()
+    #         )
+    #     self.doc_map = {}
+    #     n_passages = 0
+    #     for chunk in passages:
+    #         for p in chunk:
+    #             self.doc_map[n_passages] = p
+    #             n_passages += 1
+    #     self.embeddings = torch.concat(embeddings, dim=1)
+    
     def load_index(self, path: str, total_saved_shards: int):
-        """
-        Loads sharded embeddings and passages files (no index is loaded).
-        """
         rank = get_rank()
         ws = get_world_size()
-        assert (
-            total_saved_shards % ws == 0
-        ), f"N workers must be a multiple of shards to save"
+        assert total_saved_shards % ws == 0, "N workers must be a multiple of shards to save"
         shards_per_worker = total_saved_shards // ws
         passages = []
         embeddings = []
-        for shard_id in range(
-            rank * shards_per_worker, (rank + 1) * shards_per_worker
-        ):
+        for shard_id in range(rank * shards_per_worker, (rank + 1) * shards_per_worker):
             passage_shard_path = self._get_saved_passages_path(path, shard_id)
             with open(passage_shard_path, "rb") as fobj:
                 passages.append(pickle.load(fobj))
-            embeddings_shard_path = self._get_saved_embedding_path(
-                path, shard_id
-            )
-            embeddings.append(
-                torch.load(embeddings_shard_path, map_location="cpu").cuda()
-            )
+            embeddings_shard_path = self._get_saved_embedding_path(path, shard_id)
+            # Load embeddings to CPU memory
+            embeddings.append(torch.load(embeddings_shard_path, map_location="cpu"))
+        
         self.doc_map = {}
         n_passages = 0
         for chunk in passages:
             for p in chunk:
                 self.doc_map[n_passages] = p
                 n_passages += 1
-        self.embeddings = torch.concat(embeddings, dim=1)
-
-    def _compute_scores_and_indices(
-        self, allqueries: torch.tensor, topk: int
-    ) -> Tuple[torch.tensor, torch.tensor]:
+        # Keep embeddings in CPU memory
+        self.embeddings = torch.cat(embeddings, dim=1)
+        self.embeddings_on_gpu = False
+    
+    def to_gpu(self, batch_size=1000):
         """
-        Computes the distance matrix for the query embeddings and embeddings chunk and returns the k-nearest neighbours and corresponding scores.
+        Transfers embeddings to GPU in batches.
         """
+        if not self.embeddings_on_gpu:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            gpu_embeddings = []
+            for i in range(0, self.embeddings.shape[1], batch_size):
+                batch = self.embeddings[:, i:i+batch_size].to(device)
+                gpu_embeddings.append(batch)
+            self.embeddings = torch.cat(gpu_embeddings, dim=1)
+            self.embeddings_on_gpu = True
+    
+    def _compute_scores_and_indices(self, allqueries: torch.tensor, topk: int) -> Tuple[torch.tensor, torch.tensor]:
+        self.ensure_index_ready()
+        self.to_gpu()  # Ensure embeddings are on GPU
         scores = torch.matmul(allqueries.half(), self.embeddings)
         scores, indices = torch.topk(scores, topk, dim=1)
-
+        
         return scores, indices
+
+    ####
+
+    # def _compute_scores_and_indices(
+    #     self, allqueries: torch.tensor, topk: int
+    # ) -> Tuple[torch.tensor, torch.tensor]:
+    #     """
+    #     Computes the distance matrix for the query embeddings and embeddings chunk and returns the k-nearest neighbours and corresponding scores.
+    #     """
+    #     scores = torch.matmul(allqueries.half(), self.embeddings)
+    #     scores, indices = torch.topk(scores, topk, dim=1)
+
+    #     return scores, indices
 
     @torch.no_grad()
     def search_knn(self, queries, topk):
@@ -213,16 +268,25 @@ class DistributedIndex(object):
         
 
 class DistributedFAISSIndex(DistributedIndex):
+    # def __init__(self, index_type: str, code_size: Optional[int] = None):
+    #     super().__init__()
+    #     self.embeddings = None
+    #     self.doc_map = dict()
+    #     self.faiss_gpu_index = None
+    #     self.gpu_resources = None
+    #     self.faiss_index_trained = False
+    #     self.faiss_index_type = index_type
+    #     self.code_size = code_size
+    #     self.is_in_gpu = False
+    
     def __init__(self, index_type: str, code_size: Optional[int] = None):
         super().__init__()
         self.embeddings = None
         self.doc_map = dict()
         self.faiss_gpu_index = None
-        self.gpu_resources = None
-        self.faiss_index_trained = False
         self.faiss_index_type = index_type
         self.code_size = code_size
-        self.is_in_gpu = False
+        
 
     def _get_faiss_index_filename(self, save_index_path: str) -> str:
         """
@@ -316,18 +380,99 @@ class DistributedFAISSIndex(DistributedIndex):
         faiss_cpu_index = faiss.read_index(load_index_path)
         # move to GPU
         self._move_index_to_gpu(faiss_cpu_index)
+    
+    def load_faiss_index(self, faiss_path: str, passages: list[str]):
+        """
+        Loads a saved FAISS index and initializes doc_map with provided passages.
+        """
+        print(f"Loading FAISS index from {faiss_path}")
+        self.faiss_gpu_index = faiss.read_index(faiss_path)
+        
+        print("Initializing doc_map with provided passages")
+        self.doc_map = {i: doc for i, doc in enumerate(passages)}
 
+        print(f"Loaded index with {self.faiss_gpu_index.ntotal} vectors and {len(self.doc_map)} passages")
+
+        # Sanity check
+        if self.faiss_gpu_index.ntotal != len(self.doc_map.values()):
+            print(f"Warning: Number of vectors in FAISS index ({self.faiss_gpu_index.ntotal}) "
+                  f"does not match number of passages ({len(self.doc_map.values())})")
+
+
+    # def load_index(self, path: str, total_saved_shards: int) -> None:
+    #     """
+    #     Loads passage embeddings and passages and a faiss index (if it exists).
+    #     Otherwise, it initialises and trains the index in the GPU with GPU FAISS.
+    #     """
+    #     super().load_index(path, total_saved_shards)
+    #     load_index_path = self._get_faiss_index_filename(path)
+    #     if os.path.exists(load_index_path):
+    #         self._load_faiss_index(load_index_path)
+    #     else:
+    #         self.train_index()
+    
+    # def load_index(self, path: str, total_saved_shards: int) -> None:
+    #     super().load_index(path, total_saved_shards)
+    #     load_index_path = self._get_faiss_index_filename(path)
+    #     if os.path.exists(load_index_path):
+    #         self._load_faiss_index(load_index_path)
+    #     else:
+    #         self.index_prepared = False
+    #         logger.info("Index not found. It will be trained when first needed.")
+    
     def load_index(self, path: str, total_saved_shards: int) -> None:
         """
-        Loads passage embeddings and passages and a faiss index (if it exists).
-        Otherwise, it initialises and trains the index in the GPU with GPU FAISS.
+        Loads passage embeddings and passages. Keeps embeddings in CPU memory.
         """
         super().load_index(path, total_saved_shards)
-        load_index_path = self._get_faiss_index_filename(path)
-        if os.path.exists(load_index_path):
-            self._load_faiss_index(load_index_path)
+        # At this point, self.embeddings are in CPU memory
+
+    
+    def ensure_index_ready(self):
+        if not self.index_prepared:
+            self._prepare_index()
+
+    def _prepare_index(self):
+        logger.info("Preparing the index...")
+        self._initialise_index()
+        self.to_gpu()  # Transfer embeddings to GPU before training
+        self._train_index_parallel()
+        self.index_prepared = True
+
+    def _train_index_parallel(self):
+        """
+        Trains the index using parallel processing.
+        """
+        num_processes = min(mp.cpu_count(), 4)  # Use up to 4 processes
+        chunk_size = len(self.embeddings) // num_processes
+
+        with mp.Pool(num_processes) as pool:
+            results = list(tqdm(
+                pool.imap(self._train_index_chunk, range(num_processes)),
+                total=num_processes,
+                desc="Training index"
+            ))
+
+        # Merge results if necessary
+        # This step depends on the specific FAISS index type and may need adjustment
+        for partial_index in results[1:]:
+            self.faiss_gpu_index.merge_from(partial_index, self.faiss_gpu_index.ntotal)
+
+    def _train_index_chunk(self, chunk_id):
+        """
+        Trains a chunk of the index.
+        """
+        start = chunk_id * chunk_size
+        end = start + chunk_size if chunk_id < num_processes - 1 else len(self.embeddings)
+        chunk_embeddings = self.embeddings[:, start:end]
+
+        if isinstance(self.faiss_gpu_index, FAISSGPUIndex.__args__):
+            return self.faiss_gpu_index.train(self._cast_to_torch32(chunk_embeddings.T))
         else:
-            self.train_index()
+            return self.faiss_gpu_index.train(self._cast_to_numpy(chunk_embeddings.T))
+
+    ##################
+
 
     def is_index_trained(self) -> bool:
         if self.faiss_gpu_index is None:
@@ -431,20 +576,35 @@ class DistributedFAISSIndex(DistributedIndex):
         else:
             raise ValueError("unsupported index type")
 
-    @torch.no_grad()
-    def train_index(self) -> None:
+    # @torch.no_grad()
+    # def train_index(self) -> None:
+    #     """
+    #     It initialises the index and trains it according to the refresh index schedule.
+    #     """
+    #     if self.faiss_gpu_index is None:
+    #         self._initialise_index()
+    #     self.faiss_gpu_index.reset()
+    #     if isinstance(self.faiss_gpu_index, FAISSGPUIndex.__args__):
+    #         logger.info("Training with FAISS as torch32")
+    #         self.faiss_gpu_index.train(self._cast_to_torch32(self.embeddings.T))
+    #     else:
+    #         logger.info("Training with FAISS as numpy")
+    #         self.faiss_gpu_index.train(self._cast_to_numpy(self.embeddings.T))
+
+    def train_index(self, save_path: str = None) -> None:
         """
-        It initialises the index and trains it according to the refresh index schedule.
+        Trains the FAISS index using CPU embeddings and optionally saves it.
         """
         if self.faiss_gpu_index is None:
             self._initialise_index()
-        self.faiss_gpu_index.reset()
-        if isinstance(self.faiss_gpu_index, FAISSGPUIndex.__args__):
-            logger.info("Training with FAISS as torch32")
-            self.faiss_gpu_index.train(self._cast_to_torch32(self.embeddings.T))
-        else:
-            logger.info("Training with FAISS as numpy")
-            self.faiss_gpu_index.train(self._cast_to_numpy(self.embeddings.T))
+
+        print("Training FAISS index...")
+        self.faiss_gpu_index.train(self._cast_to_numpy(self.embeddings.T))
+        
+        self._add_embeddings_to_index()
+
+        if save_path:
+            self.save_faiss_index(save_path)
 
     @torch.no_grad()
     def _cast_to_torch32(self, embeddings: torch.tensor) -> torch.tensor:
@@ -476,3 +636,82 @@ class DistributedFAISSIndex(DistributedIndex):
         self.faiss_gpu_index = faiss.index_cpu_to_gpu(
             self.gpu_resources, torch.cuda.current_device(), cpu_index, cfg
         )
+
+    def _initialise_index(self) -> None:
+        """
+        Initialises the FAISS index on CPU.
+        """
+        dimension, num_points = self.embeddings.shape
+        n_list = min(EMBEDDINGS_DIM, math.floor(math.sqrt(num_points)))
+        
+        if self.faiss_index_type == "ivfflat":
+            self.faiss_gpu_index = faiss.IndexIVFFlat(
+                faiss.IndexFlatIP(dimension), dimension, n_list, faiss.METRIC_INNER_PRODUCT
+            )
+        elif self.faiss_index_type == "ivfpq":
+            self.faiss_gpu_index = faiss.IndexIVFPQ(
+                faiss.IndexFlatIP(dimension), dimension, n_list, 
+                self.code_size, BITS_PER_CODE, faiss.METRIC_INNER_PRODUCT
+            )
+        else:
+            raise ValueError(f"Unsupported index type: {self.faiss_index_type}")
+
+    def _add_embeddings_to_index(self) -> None:
+        """
+        Add embeddings to the trained index.
+        """
+        print("Adding embeddings to index...")
+        self.faiss_gpu_index.add(self._cast_to_numpy(self.embeddings.T))
+
+    def save_faiss_index(self, save_path: str) -> None:
+        """
+        Saves the FAISS index to a file.
+        """
+        if self.faiss_gpu_index is None:
+            raise ValueError("No index to save. Please train the index first.")
+        
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        print(f"Saving FAISS index to {save_path}")
+        faiss.write_index(self.faiss_gpu_index, save_path)
+
+    @staticmethod
+    def _cast_to_numpy(embeddings: torch.Tensor) -> np.ndarray:
+        """
+        Converts a torch tensor to a contiguous numpy float32 ndarray.
+        """
+        return embeddings.cpu().numpy().astype('float32').copy(order='C')
+
+    @torch.no_grad()
+    def search_knn(self, queries: torch.Tensor, k: int) -> Tuple[list[list[str]], np.ndarray]: # TODO: either float or np.ndarray
+        """
+        Performs k-nearest neighbor search using the loaded FAISS index.
+        """
+        if self.faiss_gpu_index is None:
+            raise ValueError("FAISS index not loaded. Call load_faiss_index first.")
+
+        # Convert queries to numpy array
+        if isinstance(queries, torch.Tensor):
+            queries = queries.cpu().numpy()
+        
+        query_numpy = queries.astype('float32')
+
+        # Perform the search
+        scores, indices = self.faiss_gpu_index.search(query_numpy, k)
+
+        # Fetch the corresponding passages
+        results = []
+        for query_indices in indices:
+            query_results = [self.doc_map[int(idx)] for idx in query_indices if int(idx) in self.doc_map]
+            results.append(query_results)
+
+        return results, scores
+    
+    @staticmethod
+    def save_passages(passages: dict, save_path: str):
+        """
+        Saves passages to a file.
+        """
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        print(f"Saving passages to {save_path}")
+        with open(save_path, 'wb') as f:
+            pickle.dump(passages, f)

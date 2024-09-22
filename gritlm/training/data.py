@@ -38,6 +38,9 @@ class CustomDataset(torch.utils.data.Dataset):
         elif mode == 'generative': 
             self.ds_generative = dataset
             self.total_len = self.len_generative = len(self.ds_generative)
+        elif mode == 'replug':
+            self.ds_generative = dataset
+            self.total_len = self.len_generative = len(self.ds_generative)
         self.args = args
         self.tokenizer = tokenizer
         self.mode = mode
@@ -128,7 +131,7 @@ class CustomDataset(torch.utils.data.Dataset):
                     raise ValueError(f"Unexpected type for neg: {type(neg)}")
             passages.extend(negs)
 
-        if (self.mode in ["unified", "generative"]) and (self.n_samples % self.take_nth == 0):
+        if (self.mode in ["unified", "generative", "replug"]) and (self.n_samples % self.take_nth == 0):
             if self.indices_gen is not None:
                 if not self.indices_gen:
                     self.set_indices()
@@ -166,6 +169,9 @@ class CustomCollator(DataCollatorWithPadding):
     assistant_eos: str = ""
 
     prefixlm: bool = False
+
+    mode: str = "embedding"
+    max_embed_len: int = 512
 
     def __call__(self, features):
         query = [f[0] for f in features]
@@ -227,6 +233,7 @@ class CustomCollator(DataCollatorWithPadding):
                 ]) for f in generative if f is not None
             ]
 
+
         if query[0] is not None:
             features["query"] = self.tokenizer(
                 query,
@@ -236,21 +243,35 @@ class CustomCollator(DataCollatorWithPadding):
                 return_tensors="pt",
                 add_special_tokens=False, # BOS / EOS is already in the prompt
             )
-            features["passage"] = self.tokenizer(
-                passage,
-                padding=True,
-                truncation=True,
-                max_length=self.passage_max_len,
-                return_tensors="pt",
-                add_special_tokens=False, # BOS / EOS is already in the prompt
-            )
+            
+            if passage:
+                features["passage"] = self.tokenizer(
+                    passage,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.passage_max_len,
+                    return_tensors="pt",
+                    add_special_tokens=False, # BOS / EOS is already in the prompt
+                )
 
         if generative[0] is not None:
+            if self.mode == "replug":
+                # What we want is similar to embeddings tokenization
+                features["embeddings"] = self.tokenizer(
+                    generative,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.passage_max_len,
+                    # max_length=self.max_embed_len, # from model config
+                    return_tensors="pt",
+                    add_special_tokens=False, # BOS / EOS is already in the prompt
+                )
+                features["query_text"] = generative[0]
+                
             features["generative"] = self.tokenizer(
                 generative,
                 padding=True,
                 truncation=True,
-                max_length=self.generative_max_len,
                 return_tensors="pt",
                 add_special_tokens=False, # BOS / EOS is already in the prompt
             )

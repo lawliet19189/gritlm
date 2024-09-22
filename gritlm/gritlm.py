@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
-
+from scripts.modeling_mistral_gritlm import MistralModel
 
 class GritLM(torch.nn.Module):
     def __init__(
@@ -25,6 +25,8 @@ class GritLM(torch.nn.Module):
                 # Somehow AutoModel does not pick the right one by default
                 from transformers import T5EncoderModel
                 self.model = T5EncoderModel.from_pretrained(model_name_or_path, **kwargs)
+            elif 'mistral' in model_name_or_path:
+                self.model = MistralModel.from_pretrained(model_name_or_path, **kwargs)
             else:
                 self.model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=True, **kwargs)
             self.embedding_attr = None
@@ -65,6 +67,7 @@ class GritLM(torch.nn.Module):
             if self.embed_eos:
                 assert self.embed_eos in self.tokenizer.vocab, f"EOS token {self.embed_eos} not in vocab"
             self.model.eval()
+            
             if not("device_map" in kwargs) and not(kwargs.get("load_in_4bit", False)) and not(kwargs.get("load_in_8bit", False)):
                 self.model.to(self.device)
                 # Parallelize embedding model
@@ -112,7 +115,8 @@ class GritLM(torch.nn.Module):
             input_was_string = True
 
         all_embeddings, all_kv_caches = [], []
-        for start_index in tqdm(range(0, len(sentences), batch_size), desc="Batches", disable=len(sentences)<256):
+        # for start_index in tqdm(range(0, len(sentences), batch_size), desc="Batches", disable=len(sentences)<256):
+        for start_index in range(0, len(sentences), batch_size):
             sentences_batch = [
                 instruction + s + self.embed_eos for s in sentences[start_index:start_index + batch_size]
             ]

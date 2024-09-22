@@ -6,6 +6,7 @@ import math
 import os
 import time
 from typing import Any, Optional
+from timeit import default_timer
 
 import torch
 import torch.distributed as dist
@@ -13,7 +14,8 @@ from tqdm import tqdm
 
 from rag import dist_utils
 from rag.prompt_choices import PromptType
-from rag.index import DistributedIndex, load_or_initialize_index
+from rag.index_io import load_or_initialize_index
+from rag.index_v2 import DistributedIndex, DistributedFAISSIndex
 from rag.tasks import get_task
 from gritlm import GritLM
 
@@ -50,6 +52,21 @@ def get_args():
         help="path for loading the index, passage embeddings and passages",
     )
     parser.add_argument(
+        "--index_mode",
+        default="faiss",
+        type=str,
+        help="Indexing mode to use. Either flat or faiss."
+    )
+    parser.add_argument(
+        "--faiss_index_type",
+        default="ivfpq",
+        type=str,
+        help="Faiss index type."
+    )
+    parser.add_argument(
+        "--faiss_code_size", default=16, type=int, help="Faiss code size."
+    )
+    parser.add_argument(
         "--save_index_path",
         default=None,
         type=str,
@@ -65,6 +82,18 @@ def get_args():
         default=1,
         type=int,
         help="how many shards to save an index to file with. Must be an integer multiple of the number of workers.",
+    )
+    parser.add_argument(
+        "--faiss_index_path",
+        default=None,
+        type=str,
+        help="Path to FAISS index"
+    )
+    parser.add_argument(
+        "--index_passages_path",
+        default=[],
+        type=str,
+        help="Path to passages that was used to build the index"
     )
     parser.add_argument(
         "--eval_data",
@@ -95,6 +124,12 @@ def get_args():
     )
     parser.add_argument("--min_new_tokens", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=16)
+    parser.add_argument(
+        "--max_passages",
+        type=int,
+        default=-1,
+        help="Number of passages that were used to build the index",
+    )
     parser.add_argument(
         "--cache",
         type=str,
@@ -192,10 +227,10 @@ def build_index(
 ):
     n_batch = math.ceil(len(passages) / gpu_embedder_batch_size)
     total = 0
-    logger.info(f"Build Index:\nBatch Size: {gpu_embedder_batch_size}\nTotal: {total}\ncache: {cache}")
     progress = tqdm()
     progress.total = n_batch
     for i in range(n_batch):
+        # start_batch = default_timer()
         batch = passages[
             i * gpu_embedder_batch_size : (i + 1) * gpu_embedder_batch_size
         ]
@@ -218,26 +253,32 @@ def build_index(
                     for layer in kv_cache
                 ]
         else:
+            # start = default_timer()
             embeddings = model.encode_corpus(
                 batch,
                 convert_to_tensor=True,
                 instruction=gritlm_instruction_format(),
+                batch_size=gpu_embedder_batch_size
             )
-        index.embeddings[:, total : total + len(embeddings)] = embeddings.T
-        #.to(
-        #    index.dtype
-        #).cpu()
+            # end = default_timer()
+            # logger.info("Time taken to encode corpus: %s", end-start)
+        
+        
+            
+        index.embeddings[:, total : total + len(embeddings)] = embeddings.T.to(
+            index.dtype
+        ).cpu()
         total += len(embeddings)
+        # end_batch = default_timer()
+        # logger.info("Time taken to encode one batch: %s", end_batch - start_batch)
+        if i % 500 == 0 and i > 0:
+            logger.info(f"Number of passages encoded: {total}")
+        
         progress.update(1)
-        # if i % 500 == 0 and i > 0:
-        #     logger.info(f"Number of passages encoded: {total}")
     progress.close()
     dist_utils.barrier()
     logger.info(f"{total} passages encoded on process: {dist_utils.get_rank()}")
-    
-    if not index.is_index_trained():
-        logger.info(f"Train faiss indices")
-        index.train_index()
+
 
 
 def _get_eval_data_iterator(args, data_path, task) -> list[dict[str, Any]]:
@@ -288,6 +329,7 @@ def evaluate(
 
     times = []
     time_to_remove = 0
+    # for i, batch in enumerate(tqdm(data_iterator)):
     for i, batch in enumerate(tqdm(data_iterator)):
         query: list[str] = batch.get("query", [""])
         answers: list[list[str]] = batch.get("answers", [[""]])
@@ -328,6 +370,7 @@ def evaluate(
                 )
                 kv_cache = None
             passages, _ = index.search_knn(query_emb, args.n_context)
+            # print(passages)
             assert (len(passages) == 1) and (
                 len(passages[0]) == 1
             ), "Only 1 passage per query supported for now"
@@ -450,6 +493,7 @@ def evaluate(
             )
 
         inputs += PROMPT
+        # print(inputs)
 
         inputs = model.tokenizer(
             inputs,
@@ -489,6 +533,7 @@ def evaluate(
 
         generation = generation[0][len(inputs["input_ids"][0]) :]
         pred: str = model.tokenizer.decode(generation, skip_special_tokens=True)
+        # print(pred)
 
         # Use em as main key since if em=1, then match & f1 are also 1
         sample_metrics = max(
@@ -611,7 +656,7 @@ if __name__ == "__main__":
         level=logging.INFO,
     )
     if args.no_retrieval is False:
-        index, passages = load_or_initialize_index(args, logger, dim=4096)
+        index, passages = load_or_initialize_index(args)#, logger, dim=4096)
     else:
         index, passages = None, None
     pool = "mean" if "bb" in args.model_name_or_path else "weightedmean"

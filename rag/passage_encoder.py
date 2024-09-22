@@ -184,9 +184,11 @@ def main():
     if args.save_index_path is None:
         logger.info("save_index_path not provided. Defaulting to index/index.faiss")
         args.save_index_path = "index/index.faiss"
-    os.makedirs(args.save_index_path, exist_ok=True)
-    logger.info("Saving final computed index!")
-    index.save_index(args.save_index_path, args.save_index_n_shards)
+    # os.makedirs(args.save_index_path, exist_ok=True)
+    logger.info("Training & saving final computed index!")
+
+    index.train_index(args.save_index_path)
+    # index.save_index(args.save_index_path, args.save_index_n_shards)
     
 if __name__ == "__main__":
     main()

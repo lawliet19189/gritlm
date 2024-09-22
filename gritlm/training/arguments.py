@@ -32,6 +32,27 @@ class ModelArguments:
     )
     projection: int = field(default=None, metadata={"help": "Optional linear learned embedding down projection"})
 
+    # REPLUG arguments
+    parent_model_name_or_path: str = field(default=None, metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models to use as a parent model for REPLUG training"})
+    parent_config_name: str = field(default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"})
+    parent_tokenizer_name: str = field(default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"})
+    parent_pooling_method: str = field(default='weightedmean', metadata={"help": "Pooling method for sentences"})
+    parent_normalized: bool = field(default=True)
+    parent_attn_implementation: str = field(default='sdpa', metadata={"help": "eager/sdpa/flash_attention_2"})
+    parent_attn: str = field(
+        default='bbcc',
+        metadata={
+            "help": "bidirectional/causal attn for emb inst., emb sample, gen inst., gen sample"
+                    " e.g. bbcc is bidirectional over both emb inst. & sample but causal over gen inst. & sample"
+                    " cccc is causal over all; bccc is bidirectional over emb inst. but causal over rest etc."
+        }
+    )
+    parent_projection: int = field(default=None, metadata={"help": "Optional linear learned embedding down projection"})
+    emb_dim: int = field(default=None, metadata={"help": "Optional embedding dimension"})
+    
+    # bf16: bool = field(default=False, metadata={"help": "Use bfloat16"})
+    # fp16: bool = field(default=False, metadata={"help": "Use float16"})
+
 @dataclass
 class DataArguments:
     train_data: str = field(
@@ -86,6 +107,13 @@ class DataArguments:
     )
     prefixlm: bool = field(default=False, metadata={"help": "PrefixLM for generative"})
 
+    # RAG training arguments
+    index_path: str = field(default=None, metadata={"help": "Path to FAISS index"})
+    index_passages_path: list[str] = field(default_factory=lambda: [], metadata={"help": "Path to passages used to build the index"})
+    index_passages_num: int = field(default=-1, metadata={"help": "Number of passages to use from the index"})
+    index_type: str = field(default='ivfpq', metadata={"help": "Type of FAISS index to use"})
+    code_size: int = field(default=16, metadata={"help": "Number of bytes for PQ coding for IVFPQ index"})
+    num_passages: int = field(default=10, metadata={"help": "Number of passages to retrieve"})
 
     def __post_init__(self):
         if not os.path.exists(self.train_data):
@@ -106,10 +134,16 @@ class CustomTrainingArguments(TrainingArguments):
             " A higher temperature can reduce the value of similarity between texts in downstream tasks."
         }
     )
+    parent_temperature: Optional[float] = field(
+        default=0.02,
+        metadata={
+            "help": "Temperature for parent generative model."
+        }
+    )
     mode: str = field(
         default='embedding', 
         metadata={
-            "help": "One of ['unified', 'embedding', 'generative']. For unified,"
+            "help": "One of ['unified', 'embedding', 'generative', 'replug']. For unified,"
             " `train_data` should point to a folder with both embedding and generative data."
         }
     )
@@ -152,3 +186,4 @@ class CustomTrainingArguments(TrainingArguments):
     split_emb_full: bool = field(default=False, metadata={"help": "Split embedding forward / backward pass"})
     emb_q_only: bool = field(default=False, metadata={"help": "Only backprop on q's"})
     emb_p_only: bool = field(default=False, metadata={"help": "Only backprop on p's (pos & neg)"})
+    save_steps: int = field(default=1000, metadata={"help": "Save steps"})

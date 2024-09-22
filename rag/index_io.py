@@ -95,7 +95,8 @@ def load_or_initialize_index(opt, custom_jsonl_transformer=default_jsonl_transfo
                 f"loading faiss index type {opt.faiss_index_type} with parameters {opt.faiss_code_size}"
             )
         index.load_index(opt.load_index_path, opt.save_index_n_shards)
-        passages = [index.doc_map[i] for i in range(len(index.doc_map))]
+        # passages = [index.doc_map[i] for i in range(len(index.doc_map))]
+        passages = load_passages(opt.passages, opt.max_passages, jsonl_transformer=custom_jsonl_transformer)
     else:
         logger.info(f"Loading passages from: {opt.passages}\nuse_file_passages: {opt.use_file_passages}")
         passages = []
@@ -103,5 +104,9 @@ def load_or_initialize_index(opt, custom_jsonl_transformer=default_jsonl_transfo
             logger.info("Running jsonl transformer!")
             passages = load_passages(opt.passages, opt.max_passages, jsonl_transformer=custom_jsonl_transformer)
             index.init_embeddings(passages)
+    
+    if opt.index_mode == "faiss":
+        # TODO: improve this
+        index.load_faiss_index(opt.faiss_index_path, passages)
 
     return index, passages

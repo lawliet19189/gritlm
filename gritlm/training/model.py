@@ -1,13 +1,19 @@
 from dataclasses import dataclass
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Optional
 
 import torch
-import torch.distributed as dist
 from torch import Tensor
-from transformers import AutoModel
+import torch.nn as nn
+import torch.distributed as dist
+import torch.nn.functional as F
+from transformers import AutoModel, AutoTokenizer
 from transformers.file_utils import ModelOutput
-
+from rag.index_v2 import DistributedFAISSIndex
+from rag.index_io import load_passages
+from rag.passage_encoder import custom_jsonl_transformer
+from rag.prompt_choices import PromptType
+from rag.tasks.qa import Task as QATask
 from gritlm import GritLM
 
 logger = logging.getLogger(__name__)
@@ -142,11 +148,12 @@ class GritLMTrainModel(GritLM):
             kwargs['instruction_lens'] = instruction_lens
         elif self.attn[:2] == 'bb':
             kwargs['is_causal'] = False
+        
         out = (getattr(self.model, self.embedding_attr) if self.embedding_attr else self.model)(**kwargs)[0]
 
         if self.projection is not None:
             out = self.projection(out)
-        
+
         # Mask out the instruction tokens for pooling
         if instruction_lens is not None:
             # Make a new copy of attention mask to prevent in-place problems
@@ -156,12 +163,15 @@ class GritLMTrainModel(GritLM):
                 attention_mask[i, :l] = 0
                 # Make sure not all zeros - If this happens it is a bug
                 assert attention_mask[i].sum() > 0, f"All 0: {attention_mask[i]}, l: {l}"
-
+        
         reps = self.pooling(out, attention_mask)
+
+        
         # Normalize can change the dtype (https://discuss.pytorch.org/t/tensor-in-float16-is-transformed-into-float32-after-torch-norm/110891)
         if self.normalized: 
             in_dtype = reps.dtype
-            return torch.nn.functional.normalize(reps, dim=-1).contiguous().to(in_dtype)
+            a = torch.nn.functional.normalize(reps, dim=-1).contiguous().to(in_dtype)
+            return a
         return reps.contiguous()
 
     def forward(
@@ -223,3 +233,86 @@ class GritLMTrainModel(GritLM):
 
     def gradient_checkpointing_enable(self, *args, **kwargs):
         self.model.gradient_checkpointing_enable(*args, **kwargs)
+
+
+class GritLMREPLUGModel(GritLMTrainModel):
+    def __init__(
+        self,
+        temperature: float = 1.0,
+        parent_model: Optional[nn.Module] = None,
+        index: DistributedFAISSIndex = None,
+        num_passages: int = 10,
+        tokenizer: AutoTokenizer = None,
+        loss_gen_type: str = "mixed",
+        loss_gen_factor: float = 1.0,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.temperature = temperature
+        self.parent_model = parent_model
+        self.num_passages = num_passages
+        self.loss_fn = nn.KLDivLoss(reduction='batchmean')
+        self.tokenizer = tokenizer
+        if self.parent_model is None:
+            raise ValueError("parent_model must be provided for REPLUG training")
+
+        self.lm_loss_fn = NextTokenLoss(parent_model.model.config.vocab_size, loss_gen_type, loss_gen_factor)
+        self.index = index
+
+    def retrieve_passages(self, queries: torch.Tensor) -> tuple[list[list[dict]], torch.Tensor]:
+        with torch.no_grad():
+            queries_np = queries.cpu().numpy()
+        passages, scores = self.index.search_knn(queries_np, self.num_passages)
+        return passages, torch.tensor(scores, device=queries.device)
+
+    def forward(self, query_text: list[str], embeddings: Dict[str, torch.Tensor] = None, **kwargs):
+        q_reps = self.encode(embeddings)
+        retrieved_passages, retriever_scores = self.retrieve_passages(q_reps)
+        
+        all_lsr_scores = []
+        all_retriever_scores = []
+
+        for batch_passages, batch_scores in zip(retrieved_passages, retriever_scores):
+            lsr_scores_batch = []
+            
+            for passage in batch_passages:
+                # Prepare input: concatenate query and passage
+                # print(query_text)
+                # print(passage['text'])
+                input_ids = self.tokenizer(query_text[0] + " " + passage['text'], return_tensors="pt", max_length=512, padding=True, truncation=True)['input_ids'].to(q_reps.device)
+                
+                # Compute LSR score
+                # with torch.no_grad():
+                outputs = self.parent_model.model(input_ids)
+                lm_score = self.lm_loss_fn(input_ids, outputs.logits)
+                lsr_score = torch.exp(-lm_score / self.temperature)
+                lsr_scores_batch.append(lsr_score)
+
+            # Normalize scores within the batch
+            lsr_scores = F.softmax(torch.stack(lsr_scores_batch), dim=0)
+            retriever_scores_norm = F.softmax(batch_scores / self.temperature, dim=0)
+            
+            all_lsr_scores.append(lsr_scores)
+            all_retriever_scores.append(retriever_scores_norm)
+
+        # Stack all batches
+        lsr_scores = torch.stack(all_lsr_scores)
+        retriever_scores = torch.stack(all_retriever_scores)
+
+        # Compute REPLUG loss (KL-divergence)
+        loss_replug = F.kl_div(retriever_scores.log(), lsr_scores, reduction='batchmean')
+
+        # If there's a generative component, compute its loss
+        # loss_gen = super().forward(generative=generative, **kwargs).loss_gen if generative is not None else None
+        loss_gen = None
+
+        # Combine losses
+        loss = loss_replug + (loss_gen if loss_gen is not None else 0)
+
+        return GritLMTrainOutput(
+            q_reps=q_reps,
+            p_reps=None,  # We don't have a single p_reps in this case
+            loss=loss,
+            loss_emb=loss_replug,
+            loss_gen=loss_gen,
+        )
