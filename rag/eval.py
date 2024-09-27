@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", default="gritlm", type=str)
+    parser.add_argument("--encoder_model_name_or_path", default=None, type=str)
     parser.add_argument(
         "--task_names",
         default=None,
@@ -303,11 +304,15 @@ def _get_eval_data_iterator(args, data_path, task) -> list[dict[str, Any]]:
 @torch.no_grad()
 def evaluate(
     model: GritLM,
+    encoder_model: GritLM,
     index: DistributedIndex,
     opt: argparse.Namespace,
     data_path: str,
 ):
+    if not encoder_model:
+        encoder_model = model
     model.eval()
+    encoder_model.eval()
     metrics = defaultdict(lambda: [])
     dataset_wpred = []
 
@@ -351,7 +356,7 @@ def evaluate(
             kv_cache: Optional[list[tuple[torch.Tensor, torch.Tensor]]]
 
             if (args.cache is not None) and ("query" in args.cache):
-                query_emb, kv_cache = model.encode_queries(
+                query_emb, kv_cache = encoder_model.encode_queries(
                     query,
                     get_cache=True,
                     convert_to_tensor=True,
@@ -362,7 +367,7 @@ def evaluate(
                     add_special_tokens=True,
                 )
             else:
-                query_emb = model.encode_queries(
+                query_emb = encoder_model.encode_queries(
                     query,
                     convert_to_tensor=True,
                     instruction=gritlm_instruction_format(),
@@ -383,7 +388,7 @@ def evaluate(
             ):
                 # In production this is cached so should not be timed
                 time_to_remove = time.time()
-                passages[0][0]["kv_cache"] = model.encode_corpus(
+                passages[0][0]["kv_cache"] = encoder_model.encode_corpus(
                     [passages[0][0]],
                     get_cache=True,
                     convert_to_tensor=False,
@@ -704,6 +709,19 @@ if __name__ == "__main__":
         del model
         gritlm_kwargs["mode"] = "unified"
         model = GritLM(args.model_name_or_path, **gritlm_kwargs)
+    
+    encoder_model = None
+    if args.encoder_model_name_or_path is not None and args.no_retrieval is False:
+        
+        gritlm_kwargs = {
+            "mode": "embedding",
+            "pooling_method": "mean",
+            "attn": "cccc",
+            "attn_implementation": "sdpa",
+            "torch_dtype": torch.bfloat16,
+        }
+        encoder_model = GritLM(args.encoder_model_name_or_path, **gritlm_kwargs)
+        
 
     for data_path in args.eval_data:
         dataset_name = os.path.basename(data_path)
@@ -745,7 +763,7 @@ if __name__ == "__main__":
 
         logger.info(f"Start Evaluation on {data_path}")
         print(f"MIN / MAX TOKS: {args.min_new_tokens} / {args.max_new_tokens}")
-        metrics = evaluate(model, index, args, data_path)
+        metrics = evaluate(model, encoder_model, index, args, data_path)
         log_message = f"Dataset: {dataset_name}"
         for k, v in metrics.items():
             log_message += f" | {v:.3f} {k}"

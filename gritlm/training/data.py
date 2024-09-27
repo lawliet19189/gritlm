@@ -273,6 +273,7 @@ class CustomCollator(DataCollatorWithPadding):
                 padding=True,
                 truncation=True,
                 return_tensors="pt",
+                max_length=self.generative_max_len,
                 add_special_tokens=False, # BOS / EOS is already in the prompt
             )
             features["generative"]["labels"] = features["generative"]["input_ids"].clone()

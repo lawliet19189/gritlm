@@ -1,38 +1,20 @@
 import logging
 import json
-import multiprocessing
 import os
 from pathlib import Path
-import random
 
-import datasets
 import torch
 import torch.distributed as dist
-from transformers import AutoConfig, AutoTokenizer, HfArgumentParser, Trainer, set_seed
+from transformers import HfArgumentParser, Trainer, set_seed
 
-from rag.index_io import load_passages
-from rag.index_v2 import DistributedFAISSIndex
-from rag.passage_encoder import custom_jsonl_transformer
+from gritlm.training.train_utils import get_quantization_config, get_rag_train_index
 
 from .arguments import CustomTrainingArguments, DataArguments, ModelArguments
 from .data import CustomCollator, CustomDataset, CustomRandomSampler
 from .model import GritLMTrainModel, GritLMREPLUGModel
-
+from .data_utils import get_tokenizer_and_config, get_train_dataset
 from gritlm.gritlm import GritLM
-
-BASE_BOS: str = "<s>"
-TURN_SEP: str = "\n"
-
-USER_BOS: str = "<|user|>\n"
-USER_EOS: str = "" # "</s>" for Zephyr format
-
-EMBED_BOS: str = "\n<|embed|>\n"
-# Am embed eos is useless as there is no generative loss on it so it won't be learned
-# & it does not add anything new; It only makes sense for lasttoken pooling
-EMBED_EOS: str = ""
-
-ASSISTANT_BOS: str = "\n<|assistant|>\n"
-ASSISTANT_EOS: str = "</s>"
+from .special_tokens import BASE_BOS, TURN_SEP, USER_BOS, USER_EOS, EMBED_BOS, EMBED_EOS, ASSISTANT_BOS, ASSISTANT_EOS
 
 # os.environ["WANDB_MODE"] = "disabled"
 
@@ -43,21 +25,6 @@ def args_to_dtype(args):
     if args.fp16: return torch.float16
     return torch.float32
 
-def filter_too_long_instructions(tokenizer, dataset, query_max_len, passage_max_len):
-    def filter_fn(example):
-        # Filter out super long examples to avoid tokenize taking forever
-        if (len(example["query"][0]) > query_max_len * 10) or not(example["query"][1]):
-            return False
-        if len(tokenizer.tokenize(BASE_BOS + USER_BOS + example["query"][0].strip("\t\n :") + USER_EOS + EMBED_BOS)) >= query_max_len:
-            return False
-        for ex in example["pos"] + example["neg"]:
-            if (len(ex[0]) > passage_max_len * 10) or not(ex[1]):
-                return False
-            if len(tokenizer.tokenize(BASE_BOS + USER_BOS + ex[0].strip("\t\n :") + USER_EOS + EMBED_BOS)) >= passage_max_len:
-                return False
-        return True
-    num_proc = max(multiprocessing.cpu_count()-2, 1) if len(dataset) > 5000 else 1
-    return dataset.filter(filter_fn, num_proc=num_proc, load_from_cache_file=True)
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments))
@@ -114,20 +81,16 @@ def main():
     elif (training_args.no_gen_gas or training_args.no_emb_gas):
         raise ValueError("Cannot use no_gen_gas or no_emb_gas without GradCache")
 
-    tokenizer = AutoTokenizer.from_pretrained(
+
+    # load tokenizer and config
+    tokenizer, config = get_tokenizer_and_config(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-        padding_side="right", # Has to be right so masking of instruction tokens works correctly
-    )
-    config = AutoConfig.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-        num_labels=1,
     )
     logger.info('Config: %s', config)
 
-    if not(tokenizer.pad_token) and tokenizer.bos_token:
-        tokenizer.pad_token = tokenizer.bos_token
-        logger.info('Set pad token to bos token: %s', tokenizer.pad_token)   
-    
+
+    # REPLUG requires RAG setup including index, passages, and parent tokenizer
     if training_args.mode == "replug":
         assert data_args.index_path is not None, "Index path must be provided for RAG training"
         assert data_args.index_passages_path is not None, "Index passages path must be provided for RAG training"
@@ -135,110 +98,42 @@ def main():
         assert data_args.code_size is not None, "Code size must be provided for RAG training"
         assert data_args.num_passages is not None, "Number of passages must be provided for RAG training"
 
-        parent_tokenizer = AutoTokenizer.from_pretrained(
-            model_args.parent_model_name_or_path,
-            padding_side="right", # Has to be right so masking of instruction tokens works correctly
+        _, parent_config = get_tokenizer_and_config(
+            model_args.parent_tokenizer_name if model_args.parent_tokenizer_name else model_args.parent_model_name_or_path,
+            model_args.parent_config_name if model_args.parent_config_name else model_args.parent_model_name_or_path,
         )
-        parent_config = AutoConfig.from_pretrained(
-            model_args.parent_model_name_or_path,
-            num_labels=1,
-        )
-        logger.info('Prent Config: %s', parent_config)
+        logger.info('Parent Config: %s', parent_config)
 
-        if not(parent_tokenizer.pad_token) and parent_tokenizer.bos_token:
-            parent_tokenizer.pad_token = parent_tokenizer.bos_token
-            logger.info('Set pad token to bos token for parent: %s', parent_tokenizer.pad_token)
-    
-
+    # training data can either be a single file or a directory containing files
     data_files = [os.path.join(data_args.train_data, x) for x in os.listdir(data_args.train_data)] if \
         os.path.isdir(data_args.train_data) else [data_args.train_data]
-    train_ds, ds_embedding_lens = [], []
     
+    # Each training dataset can have a different number of samples. 
+    # This is useful for example when we want to train a single model on multiple datasets with different number of samples.
     num_samples = None
     if data_args.num_samples:
-        with open(data_args.num_samples, "r") as f:
+        with open(data_args.num_samples, "r", encoding="utf-8") as f:
             num_samples = json.load(f)
     
-    ds_name_to_samples = {}
-
+    # If generative max len is not set, use the passage max len
     if data_args.generative_max_len is None:
         data_args.generative_max_len = data_args.passage_max_len
 
-    for file in data_files:
-        logger.info("Loading dataset %s", file)
-        tmp_ds = datasets.load_dataset('json', data_files=file, split='train')
-        tmp_ds_len = len(tmp_ds)
-        # For testing, can add an origin column:
-        # origin_col = [file] * len(tmp_ds)
-        # tmp_ds = tmp_ds.add_column("origin", origin_col)
-        if tmp_ds_len > data_args.max_example_num_per_dataset:
-            tmp_ds = tmp_ds.select(
-                random.sample(list(range(tmp_ds_len)), data_args.max_example_num_per_dataset)
-            )
-        # Check if has instructions separated such that they will be masked out later
-        # If so filter out samples where the instructions are too long else they will all be 0s
-        if training_args.mode in ["embedding", "unified", "replug"] and "query" in tmp_ds.features:
-            if isinstance(tmp_ds[0]['query'], (tuple, list)):
-                logger.info(f"Filtering out embedding samples with too long instructions for {file}")
-                tmp_ds = filter_too_long_instructions(
-                    tokenizer,
-                    tmp_ds,
-                    data_args.query_max_len,
-                    data_args.passage_max_len,
-                )
-                if num_samples:
-                    assert file.split("/")[-1] in num_samples, f'Missing num_samples for {file.split("/")[-1]}'
-                    tmp_ds_len = len(tmp_ds)
-                    samples = num_samples[file.split("/")[-1]]
-                    if tmp_ds_len > samples:                    
-                        tmp_ds = tmp_ds.select(random.sample(list(range(tmp_ds_len)), samples))
-            ds_name_to_samples[file.split("/")[-1]] = len(tmp_ds)
-            train_ds.append(tmp_ds)
-            continue
-        if training_args.mode in ["unified", "generative", "replug"] and "text" in tmp_ds.features:
-            if isinstance(tmp_ds[0]['text'], (tuple, list)):
-                logger.info(f"Filtering out generative samples with too long instructions for {file}")
-                # Use passage_max_len, as this is the seq len limit for the entire generative snippet
-                num_proc = max(multiprocessing.cpu_count()-2, 1) if tmp_ds_len > 5000 else 1
-                tmp_ds = tmp_ds.filter(
-                    lambda ex: len(tokenizer.tokenize(USER_BOS + ex["text"][0] + USER_EOS + ASSISTANT_BOS)) < data_args.generative_max_len,
-                    num_proc=num_proc,
-                    load_from_cache_file=True,
-                )
-            ds_name_to_samples[file.split("/")[-1]] = len(tmp_ds)
-            train_ds.append(tmp_ds)
-            continue
-        logger.info("Skipping dataset %s as its type could not be identified", file)
-    if training_args.mode == "embedding":
-        ds_embedding_lens = [len(t) for t in train_ds]
-        ds = datasets.concatenate_datasets(train_ds)
-        logger.info("Embedding mode: %d samples", len(ds))
-    elif training_args.mode == "generative":
-        ds = datasets.concatenate_datasets(train_ds)
-        logger.info("Generative mode: %d samples", len(ds))
-    elif training_args.mode == "replug":
-        ds = datasets.concatenate_datasets(train_ds)
-        logger.info("Replug mode: %d samples", len(ds))
-    elif training_args.mode == "unified":
-        ds_embedding = datasets.concatenate_datasets([
-            t for t in train_ds if "query" in t.features
-        ])
-        ds_generative = datasets.concatenate_datasets([
-            t for t in train_ds if "text" in t.features
-        ])
-        logger.info("Unified mode: %d embedding samples, %d generative samples",
-            len(ds_embedding), len(ds_generative)
-        )
-        for t in train_ds:
-            if "query" in t.features:
-                num_samples = len(t)
-                ds_embedding_lens.append(num_samples)
-        ds = [ds_embedding, ds_generative]
-    else:
-        raise NotImplementedError(training_args.mode)
+    # Iterate over all training files, load them as datasets, filter out too long instructions, and concatenate them
+    ds, ds_name_to_samples, ds_embedding_lens = get_train_dataset(
+        train_files=data_files,
+        tokenizer=tokenizer,
+        max_example_num_per_dataset=training_args.max_example_num_per_dataset,
+        query_max_len=data_args.query_max_len,
+        passage_max_len=data_args.passage_max_len,
+        generative_max_len=data_args.generative_max_len,
+        num_samples=num_samples,
+        mode=training_args.mode,
+    )
 
+    # Save dataset num samples to a json file
     os.makedirs(training_args.output_dir, exist_ok=True)
-    with open(os.path.join(training_args.output_dir, "dataset_num_samples.json"), "w") as f:
+    with open(os.path.join(training_args.output_dir, "dataset_num_samples.json"), "w", encoding="utf-8") as f:
         json.dump(ds_name_to_samples, f)
 
     if training_args.per_device_generative_bs is not None:
@@ -247,21 +142,17 @@ def main():
             "Generative batch size must be smaller than regular batch size"
         logger.info("Using generative batch size %d per device", training_args.per_device_generative_bs)
 
-
-    quantization_config, load_in_4bit = None, False
-    if training_args.qlora:
-        from transformers import BitsAndBytesConfig
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
+    
+    quantization_config, load_in_4bit = get_quantization_config(qlora_enabled=training_args.qlora)
 
     if training_args.mode == "replug":
-        index = DistributedFAISSIndex(data_args.index_type, data_args.code_size)
-        all_passages = load_passages(data_args.index_passages_path, data_args.index_passages_num, custom_jsonl_transformer)
-        index.load_faiss_index(data_args.index_path, all_passages)
+        index = get_rag_train_index(
+            index_path=data_args.index_path,
+            index_passages_path=data_args.index_passages_path,
+            index_passages_num=data_args.index_passages_num,
+            index_type=data_args.index_type,
+            code_size=data_args.code_size,
+        )
 
         logger.info("Loading parent model")
         frozen_model = GritLM(

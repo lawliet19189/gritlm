@@ -279,7 +279,7 @@ class GritLMREPLUGModel(GritLMTrainModel):
                 # Prepare input: concatenate query and passage
                 # print(query_text)
                 # print(passage['text'])
-                input_ids = self.tokenizer(query_text[0] + " " + passage['text'], return_tensors="pt", max_length=512, padding=True, truncation=True)['input_ids'].to(q_reps.device)
+                input_ids = self.tokenizer(query_text[0] + " " + passage['text'], return_tensors="pt", max_length=256, padding=True, truncation=True)['input_ids'].to(q_reps.device)
                 
                 # Compute LSR score
                 # with torch.no_grad():
